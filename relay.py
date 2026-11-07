@@ -68,6 +68,30 @@ def _expiry_phrase(ttl_seconds: float) -> str:
     return "channels are deleted after %g %s without a new message" % (hours, unit)
 
 
+def parse_restore_specs(values: Iterable[str]) -> list[tuple[str, str, int]]:
+    """Parse TOKEN[:NAME[:NEXT_SEQ]] specs from flags/env for startup restore."""
+    specs: list[tuple[str, str, int]] = []
+    for value in values:
+        for item in str(value).split(","):
+            item = item.strip()
+            if not item:
+                continue
+            parts = item.split(":", 2)
+            token = parts[0].strip().lower()
+            if not TOKEN_RE.match(token):
+                raise ValueError("restore token must be 32 lowercase hex chars: %r" % parts[0])
+            name = parts[1].strip()[:128] if len(parts) > 1 else ""
+            next_seq = 1
+            if len(parts) > 2 and parts[2].strip():
+                try:
+                    next_seq = int(parts[2])
+                except ValueError:
+                    raise ValueError("restore next_seq must be an integer: %r" % parts[2])
+            if next_seq < 1:
+                raise ValueError("restore next_seq must be >= 1")
+            specs.append((token, name, next_seq))
+    return specs
+
 class ApiError(Exception):
     """An error that maps directly onto an HTTP status code."""
 
@@ -170,6 +194,7 @@ class Relay:
         base_url: str | None = None,
         admin_token: str | None = None,
         revision: str | None = None,
+        restore: Iterable[tuple[str, str, int]] | None = None,
     ):
         self.lock = threading.RLock()
         self.channels: dict[str, Channel] = {}
@@ -180,6 +205,16 @@ class Relay:
         self.admin_token = admin_token or None
         self.revision = (revision or os.environ.get("RELAY_REVISION") or "dev").strip() or "dev"
         self.started_mono = time.monotonic()
+        for token, name, next_seq in restore or []:
+            if token in self.channels or len(self.channels) >= self.max_channels:
+                continue
+            channel = Channel(token, name or "channel-" + token[:8], self.max_messages, self.lock)
+            channel.next_seq = max(1, int(next_seq))
+            self.channels[token] = channel
+            LOG.info(
+                "channel restored: token=%s name=%r next_seq=%d",
+                mask_tokens(token), channel.name, channel.next_seq,
+            )
 
     # -- channels -----------------------------------------------------------
 
@@ -1226,6 +1261,13 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--channel-ttl-hours", type=float, default=DEFAULT_TTL_HOURS, help="idle hours before a channel is removed (0 disables)")
     parser.add_argument("--max-channels", type=int, default=DEFAULT_MAX_CHANNELS, help="maximum live channels")
     parser.add_argument("--admin-token", default=None, help="require this token on POST /channels (env: RELAY_ADMIN_TOKEN)")
+    parser.add_argument(
+        "--restore-channel",
+        action="append",
+        default=[],
+        metavar="TOKEN[:NAME[:NEXT_SEQ]]",
+        help="recreate a channel token at startup (repeatable; env: RELAY_RESTORE_CHANNELS)",
+    )
     parser.add_argument("--log-level", default="info", help="debug, info, warning, error")
     return parser.parse_args(argv)
 
@@ -1236,12 +1278,21 @@ def main(argv: Iterable[str] | None = None) -> None:
         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    restore_values = list(args.restore_channel)
+    if os.environ.get("RELAY_RESTORE_CHANNELS"):
+        restore_values.append(os.environ["RELAY_RESTORE_CHANNELS"])
+    try:
+        restore = parse_restore_specs(restore_values)
+    except ValueError as exc:
+        raise SystemExit("invalid --restore-channel: %s" % exc)
     relay = Relay(
         max_messages=args.max_messages,
         ttl_seconds=max(0.0, args.channel_ttl_hours) * 3600,
         max_channels=args.max_channels,
         base_url=args.public_url,
         admin_token=args.admin_token or os.environ.get("RELAY_ADMIN_TOKEN"),
+        revision=os.environ.get("RELAY_REVISION"),
+        restore=restore,
     )
     httpd = make_server(args.host, args.port, relay)
     host, port = httpd.server_address[:2]

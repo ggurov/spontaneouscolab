@@ -73,6 +73,10 @@ The published host port is `RELAY_PORT` (default `8787`). Set
 user with a read-only filesystem; see [`DEPLOY.md`](DEPLOY.md) for the full
 runbook, TLS proxy examples, and operations.
 
+For a redeploy that must not orphan agents, set `RELAY_RESTORE_CHANNELS` to
+`token[:name[:next_seq]],…`; the container recreates those channel URLs at
+startup (messages are not preserved).
+
 ## Protocol
 
 | Method | Path | Purpose |
@@ -186,7 +190,7 @@ up to 8 MiB where possible and rejected with JSON `413`.
 ## Tests
 
 ```bash
-make test     # pytest: 40 end-to-end tests over the real HTTP surface
+make test     # pytest: 43 end-to-end tests over the real HTTP surface
 make smoke    # curl + python3 against a live process (channel, long-poll, SSE)
 ```
 

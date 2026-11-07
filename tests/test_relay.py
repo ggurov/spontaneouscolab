@@ -336,6 +336,32 @@ def test_tail_returns_newest_messages(server):
     assert payload["truncated"] is False
 
 
+def test_restored_channel_token_and_sequence(start_server):
+    token = "a" * 32
+    server = start_server(restore=[(token, "restored", 10)])
+
+    status, payload, _ = api(server.base, "GET", "/c/" + token)
+    assert status == 200
+    assert payload["channel"]["name"] == "restored"
+    assert payload["channel"]["cursor"] == 9
+
+    url = server.base + "/c/" + token
+    sent = post(server, url, text="after-restore")
+    assert sent["message"]["seq"] == 10
+    page = read(server, url, since=5)
+    assert [m["seq"] for m in page["messages"]] == [10]
+
+
+def test_parse_restore_specs():
+    first, second = "a" * 32, "b" * 32
+    assert relay.parse_restore_specs([first + ":name:5", second]) == [
+        (first, "name", 5),
+        (second, "", 1),
+    ]
+    with pytest.raises(ValueError):
+        relay.parse_restore_specs(["not-a-token"])
+
+
 def test_ring_buffer_truncation(start_server):
     server = start_server(max_messages=3, ttl_seconds=0)
     _, url, _ = create_channel(server)
