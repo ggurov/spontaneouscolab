@@ -1,0 +1,40 @@
+# OpenWolf: machine-local state. Protocol: SHARDS.md (repo-owned, update-immune).
+#
+# Committed state (the shard protocol, 2026-09-18 cutover):
+#   SHARDS.md, config.json, cerebrum/ (5 section files), STATUS.md (lean),
+#   memory.md (frozen), token-ledger.json (frozen), buglog/ (per-session JSONL
+#   shards — THE bug log), status/done/ (one file per milestone),
+#   anatomy-seed.json (curated seed), hooks/ (frozen vendored stack) and tools/
+#   (repo-owned shard tooling).
+#
+# Derived, machine-local — NEVER commit these (the "derived + committed" class
+# caused every manual wolf merge in this repo's history):
+#   buglog.json     rebuilt from buglog/ shards by wolf_bug.js rebuild (bootstrap)
+#   anatomy.md      regenerated per machine by the post-write hook
+#   anatomy-index.json   same
+#
+# Two deliberate deviations from the stock OpenWolf 2.5 ignore list (unchanged):
+#
+#   - hooks/ stays COMMITTED (fresh containers have no `openwolf` install — the
+#     CLI is RETIRED here anyway; `git checkout -- .wolf` is the recovery path).
+#   - token-ledger.json stays COMMITTED as a frozen history snapshot; new
+#     telemetry is one session-ledgers/SESSION-<host>-<uuid>.json per session.
+#
+# Everything below is genuinely per-machine or per-session.
+backups/
+cache/
+daemon.log
+daemon.pid
+dashboard-token
+typesafe-api-key
+_scan-state.json
+*.lock
+*.tmp
+/buglog.json
+/anatomy.md
+/anatomy-index.json
+
+# Hook runtime: per-session state and health heartbeats, not the scripts.
+hooks/_*.json
+hooks/sessions/
+hooks/session-identities/

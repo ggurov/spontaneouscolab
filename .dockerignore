@@ -1,0 +1,14 @@
+.git
+.github
+.wolf
+.claude
+__pycache__
+*.py[cod]
+.pytest_cache
+.venv
+tests
+scripts
+*.md
+problem.txt
+Makefile
+compose.yaml

@@ -1,0 +1,30 @@
+name: spontaneouscolab
+
+services:
+  relay:
+    build:
+      context: .
+    image: spontaneouscolab:latest
+    container_name: spontaneouscolab
+    restart: unless-stopped
+    ports:
+      - "${RELAY_PORT:-8787}:8787"
+    environment:
+      RELAY_ADMIN_TOKEN: ${RELAY_ADMIN_TOKEN:-}
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/healthz', timeout=2).read()
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

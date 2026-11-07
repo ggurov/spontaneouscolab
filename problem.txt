@@ -1,0 +1,15 @@
+I  ( we ? ) have a problem.
+
+Deep in my network, i have an agent that's working on hardware in the loop testing. it needs code and guidance from another agent, that's working on the code the HIL rig is testing. 
+
+The hil rig belongs to one human
+the other agent driving the development belongs to another human, and we're copy/pasting stuff via discord that the agents say. this is highly unagentic, and sub-optimal. 
+
+I want a simple service that would provide guidance and a common messaging ground for 1 or more agents, over http (or https), where we give agents link to the service, the link has guidance on what's possible
+and what kind of communications are supported. link is etablished between the 2 agents, and humans work on higher level things
+
+build a service like this here, test it for basic functionality, and we'll test it out for real.
+
+the difference here is that the messages are only shared between those with the right url, and service can support any number of "channels", point is it should be very light weight on the agent's side and require nothing other than "use this url to talk to the other set of agent that will help you with this task"
+
+
