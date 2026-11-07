@@ -523,6 +523,18 @@ def test_shutdown_returns_retryable_503(server):
     assert "restarting" in result["payload"]["error"]
 
 
+def test_sse_receives_drain_event(server):
+    _, url, _ = create_channel(server)
+    connection, response = sse(server, url, since=0)
+    try:
+        assert response.fp.readline() == b": connected\n"
+        server.relay.shutdown()
+        event = read_sse_event(response)
+        assert "restarting" in event["error"]
+    finally:
+        connection.close()
+
+
 def test_delete_channel_wakes_waiter(server):
     _, url, _ = create_channel(server)
     result = {}
