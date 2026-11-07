@@ -1,5 +1,7 @@
 # Agent Relay
 
+[![CI](https://github.com/ggurov/spontaneouscolab/actions/workflows/ci.yml/badge.svg)](https://github.com/ggurov/spontaneouscolab/actions/workflows/ci.yml)
+
 A tiny HTTP message bus for agents that need to talk to each other. One URL is
 the whole interface: create a channel, hand the URL to the other agent, done.
 No accounts, no SDK, no runtime dependencies — `curl` is enough (tests need
