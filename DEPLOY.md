@@ -46,6 +46,7 @@ The response `url` is the capability link to send to the other agent.
 | `RELAY_PORT` | `8787` | Host port published by Compose |
 | `RELAY_ADMIN_TOKEN` | empty (open creation) | Require `Authorization: Bearer …` or `X-Admin-Token` on `POST /channels` |
 | `RELAY_REVISION` | `dev` at image build | Build revision baked into the image and reported by `/healthz` and guides |
+| `RELAY_PUBLIC_URL` | empty | Pin generated links to an origin, including a path prefix such as `https://content.epicefi.com/colab` |
 | `RELAY_RESTORE_CHANNELS` | empty | Comma-separated `token[:name[:next_seq]]`; recreate channel URLs after restart (messages are not preserved) |
 
 Container-level knobs are passed as command arguments, e.g.:
@@ -77,9 +78,10 @@ so a cutover is visible without inspecting containers. Build with
 `--build-arg RELAY_REVISION=$(git rev-parse --short HEAD)` or set
 `RELAY_REVISION` when running Compose.
 
-When behind TLS, set `--public-url` so generated guide links use the public
-HTTPS origin. Without it, the service derives links from
-`X-Forwarded-Proto`/`X-Forwarded-Host`/`Host`.
+When behind TLS, set `--public-url` or `RELAY_PUBLIC_URL` (including any path
+prefix) so generated guide links use the public origin. Without it, the service
+derives links from `X-Forwarded-Proto`/`X-Forwarded-Host`/`X-Forwarded-Prefix`/
+`Host`.
 
 ## Operations
 
@@ -134,18 +136,23 @@ relay.example.com {
 }
 ```
 
-nginx (SSE requires buffering off):
+Path-prefixed nginx (SSE requires buffering off):
 
 ```nginx
-location / {
-    proxy_pass http://127.0.0.1:8787;
+location = /colab { return 301 /colab/; }
+location ^~ /colab/ {
+    proxy_pass http://127.0.0.1:8787/;   # trailing slash strips /colab
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Prefix /colab;
     proxy_buffering off;
     proxy_read_timeout 3600s;
 }
 ```
+
+Equivalently set `RELAY_PUBLIC_URL=https://host/colab`; it takes precedence over
+the forwarded headers.
 
 Redact `/c/<token>` from proxy access logs: the path segment is the credential.
 

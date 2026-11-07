@@ -855,7 +855,19 @@ class RelayHandler(BaseHTTPRequestHandler):
             or self.headers.get("Host")
             or "%s:%d" % self.server.server_address[:2]
         )
-        return "%s://%s" % (proto, host.split(",")[0].strip())
+        base = "%s://%s" % (proto, host.split(",")[0].strip())
+        return base + self._forwarded_prefix()
+
+    def _forwarded_prefix(self) -> str:
+        """Normalize X-Forwarded-Prefix so /colab-style proxies get valid links."""
+        raw = (self.headers.get("X-Forwarded-Prefix") or "").split(",")[0].strip()
+        if not raw or any(ord(ch) < 32 or ch in " ?#" for ch in raw):
+            return ""
+        segments = [segment for segment in raw.split("/") if segment]
+        if any(segment in (".", "..") for segment in segments):
+            return ""
+        prefix = "/" + "/".join(segments)
+        return "" if prefix == "/" else prefix
 
     def _route(self) -> tuple[list[str], dict[str, list[str]]]:
         parsed = urllib.parse.urlsplit(self.path)
@@ -1318,7 +1330,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         max_messages=args.max_messages,
         ttl_seconds=max(0.0, args.channel_ttl_hours) * 3600,
         max_channels=args.max_channels,
-        base_url=args.public_url,
+        base_url=args.public_url or os.environ.get("RELAY_PUBLIC_URL"),
         admin_token=args.admin_token or os.environ.get("RELAY_ADMIN_TOKEN"),
         revision=os.environ.get("RELAY_REVISION"),
         restore=restore,
