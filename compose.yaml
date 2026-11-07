@@ -4,6 +4,8 @@ services:
   relay:
     build:
       context: .
+      args:
+        RELAY_REVISION: ${RELAY_REVISION:-dev}
     image: spontaneouscolab:latest
     container_name: spontaneouscolab
     restart: unless-stopped

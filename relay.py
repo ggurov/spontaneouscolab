@@ -169,6 +169,7 @@ class Relay:
         max_channels: int = DEFAULT_MAX_CHANNELS,
         base_url: str | None = None,
         admin_token: str | None = None,
+        revision: str | None = None,
     ):
         self.lock = threading.RLock()
         self.channels: dict[str, Channel] = {}
@@ -177,6 +178,7 @@ class Relay:
         self.max_channels = max(1, int(max_channels))
         self.base_url = (base_url or "").rstrip("/") or None
         self.admin_token = admin_token or None
+        self.revision = (revision or os.environ.get("RELAY_REVISION") or "dev").strip() or "dev"
         self.started_mono = time.monotonic()
 
     # -- channels -----------------------------------------------------------
@@ -353,8 +355,8 @@ class Relay:
         with self.lock:
             return {
                 "ok": True,
+                "revision": self.revision,
                 "channels": len(self.channels),
-                "uptime_s": round(time.monotonic() - self.started_mono, 1),
                 "limits": {
                     "messages_per_channel": self.max_messages,
                     "max_channels": self.max_channels,
@@ -421,6 +423,7 @@ This page is available as JSON with `Accept: application/json` or `?format=json`
 SERVICE_GUIDE_JSON = {
     "service": "agent-relay",
     "protocol_version": PROTOCOL_VERSION,
+    "revision": "runtime",
     "summary": "Capability-URL message bus: create a channel, share its URL, exchange JSON messages.",
     "create_channel": {
         "method": "POST",
@@ -452,6 +455,7 @@ with the agents you want in this conversation.
 
 - channel URL: %(url)s
 - created: %(created)s, last activity: %(last_activity)s
+- build: %(revision)s
 - participants: %(participants)s
 - long-poll readers waiting: %(waiters)d
 - messages retained: %(retained)d (cursor %(cursor)d, oldest %(oldest)s)
@@ -551,7 +555,7 @@ reports how many long-poll readers were waiting.
 """
 
 
-def channel_guide(channel: Channel, base: str, ttl_seconds: float, max_messages: int) -> str:
+def channel_guide(channel: Channel, base: str, ttl_seconds: float, max_messages: int, revision: str = "dev") -> str:
     info = channel.info(ttl_seconds)
     participants = channel.participant_list()
     if participants:
@@ -569,6 +573,7 @@ def channel_guide(channel: Channel, base: str, ttl_seconds: float, max_messages:
     return CHANNEL_GUIDE % {
         "name_suffix": ": " + channel.name if channel.name else "",
         "url": "%s/c/%s" % (base, channel.token),
+        "revision": revision,
         "created": info["created_at"],
         "last_activity": info["last_activity_at"],
         "participants": rendered,
@@ -583,10 +588,11 @@ def channel_guide(channel: Channel, base: str, ttl_seconds: float, max_messages:
     }
 
 
-def channel_guide_json(channel: Channel, base: str, ttl_seconds: float) -> dict[str, Any]:
+def channel_guide_json(channel: Channel, base: str, ttl_seconds: float, revision: str = "dev") -> dict[str, Any]:
     url = "%s/c/%s" % (base, channel.token)
     return {
         "service": "agent-relay",
+        "revision": revision,
         "protocol_version": PROTOCOL_VERSION,
         "channel": {"token": channel.token, "url": url, **channel.info(ttl_seconds)},
         "participants": channel.participant_list(),
@@ -657,24 +663,37 @@ class RelayHandler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:  # noqa: N802
         self._method_not_allowed()
 
+    def _allow_for(self, parts: list[str]) -> str:
+        methods = ["GET", "HEAD"]
+        if parts and parts[0] == "c" and len(parts) >= 2:
+            rest = parts[2:]
+            if not rest:
+                methods = ["GET", "HEAD", "DELETE"]
+            elif rest == ["messages"]:
+                methods = ["GET", "HEAD", "POST"]
+            elif rest == ["join"]:
+                methods = ["POST"]
+        elif parts == ["channels"]:
+            methods = ["POST"]
+        return ", ".join(methods + ["OPTIONS"])
+
     def _method_not_allowed(self) -> None:
-        self._send_json(
-            405,
-            {"error": "method not allowed"},
-            extra={"Allow": "GET, HEAD, POST, DELETE, OPTIONS"},
-        )
+        parts, _query = self._route()
+        self._send_error(405, {"error": "method not allowed"}, extra={"Allow": self._allow_for(parts)})
     def handle_one_request(self) -> None:
         self._headers_sent = False
         self._body_read = False
         super().handle_one_request()
 
     def do_OPTIONS(self) -> None:  # noqa: N802
+        parts, _query = self._route()
+        allow = self._allow_for(parts)
         self._send(
             204,
             b"",
             extra={
-                "Allow": "GET, HEAD, POST, DELETE, OPTIONS",
-                "Access-Control-Allow-Methods": "GET, HEAD, POST, DELETE, OPTIONS",
+                "Allow": allow,
+                "Access-Control-Allow-Methods": allow,
                 "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Token",
             },
         )
@@ -687,13 +706,20 @@ class RelayHandler(BaseHTTPRequestHandler):
         except ApiError as exc:
             if self.command == "POST" and not getattr(self, "_body_read", False):
                 self.close_connection = True
-            self._send_json(exc.status, {"error": exc.message}, extra=exc.headers)
+            self._send_error(exc.status, {"error": exc.message}, extra=exc.headers)
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
         except Exception:  # pragma: no cover - defensive
             LOG.exception("unhandled error: %s %s", self.command, mask_tokens(self.path))
             if not self._headers_sent:
-                self._send_json(500, {"error": "internal server error"})
+                self._send_error(500, {"error": "internal server error"})
+            self.close_connection = True
+
+    def _send_error(self, status: int, payload: Any, extra: dict[str, str] | None = None) -> None:
+        """Write an error response, tolerating a peer that already hung up."""
+        try:
+            self._send_json(status, payload, extra=extra)
+        except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
 
     def _send(
@@ -833,6 +859,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             if self._wants_json(query):
                 payload = dict(SERVICE_GUIDE_JSON)
                 payload["limits"] = self.relay.health()["limits"]
+                payload["revision"] = self.relay.revision
                 self._send_json(200, payload)
             else:
                 self._send(
@@ -845,7 +872,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json(200, self.relay.health())
             return
         if parts == ["channels"]:
-            raise ApiError(405, "use POST /channels to create a channel", headers={"Allow": "POST"})
+            raise ApiError(405, "use POST /channels to create a channel", headers={"Allow": self._allow_for(parts)})
         if parts[0] != "c":
             raise ApiError(404, "unknown endpoint")
         channel = self._channel(parts)
@@ -855,9 +882,11 @@ class RelayHandler(BaseHTTPRequestHandler):
             base = self._base_url()
             with self.relay.lock:
                 if wants_json:
-                    payload = channel_guide_json(channel, base, self.relay.ttl_seconds)
+                    payload = channel_guide_json(channel, base, self.relay.ttl_seconds, self.relay.revision)
                 else:
-                    text = channel_guide(channel, base, self.relay.ttl_seconds, self.relay.max_messages)
+                    text = channel_guide(
+                        channel, base, self.relay.ttl_seconds, self.relay.max_messages, self.relay.revision
+                    )
             if wants_json:
                 self._send_json(200, payload)
             else:
