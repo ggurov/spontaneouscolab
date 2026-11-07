@@ -613,13 +613,25 @@ class RelayHandler(BaseHTTPRequestHandler):
         except ApiError as exc:
             if self.command == "POST" and not getattr(self, "_body_read", False):
                 self.close_connection = True
-            self._send_json(exc.status, {"error": exc.message}, extra=exc.headers)
+            self._send_error(exc.status, {"error": exc.message}, extra=exc.headers)
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
         except Exception:  # pragma: no cover - defensive
             LOG.exception("unhandled error: %s %s", self.command, mask_tokens(self.path))
             if not self._headers_sent:
-                self._send_json(500, {"error": "internal server error"})
+                self._send_error(500, {"error": "internal server error"})
+            self.close_connection = True
+
+    def _send_error(self, status: int, payload: Any, extra: dict[str, str] | None = None) -> None:
+        """Send an error body, tolerating a peer that already hung up.
+
+        A long-poll whose client disconnected still wakes with 410 when the
+        channel is deleted; writing that response must not escape as a
+        traceback from socketserver.
+        """
+        try:
+            self._send_json(status, payload, extra=extra)
+        except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
 
     def _send(

@@ -2,6 +2,8 @@
 
 import http.client
 import json
+import socket
+import struct
 import threading
 import time
 import urllib.error
@@ -406,6 +408,35 @@ def test_delete_channel_wakes_waiter(server):
 
     assert result["status"] == 410
     assert "closed" in result["payload"]["error"]
+
+
+def test_abandoned_waiter_socket_logs_no_traceback(server, capfd):
+    _, url, _ = create_channel(server)
+
+    # A long-poll that gives up: RST instead of FIN, like a closed browser tab.
+    sock = socket.create_connection((server.host, server.port), timeout=5)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    sock.sendall(
+        ("GET %s/messages?since=0&wait=10 HTTP/1.1\r\nHost: test\r\n\r\n" % path_of(url)).encode()
+    )
+    wait_for_waiters(server, url)
+    sock.close()
+
+    # Deleting wakes that waiter with 410; writing the error to the dead
+    # socket must not escape _dispatch as a socketserver traceback.
+    status, payload, _ = api(server.base, "DELETE", path_of(url))
+    assert status == 204, payload
+
+    captured = ""
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline:
+        captured += capfd.readouterr().err
+        if "Exception occurred during processing of request" in captured:
+            break
+        time.sleep(0.05)
+
+    assert "Exception occurred during processing of request" not in captured
+    assert api(server.base, "GET", "/healthz")[0] == 200
 
 
 def test_sse_delivers_history_and_live_messages(server):
