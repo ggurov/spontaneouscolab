@@ -76,7 +76,7 @@ The repo carries a vendored `.wolf/` memory tree and `.claude/` hooks from
 
 ```bash
 make run                    # python3 relay.py --host 127.0.0.1 --port 8787
-make test                   # pytest -q (48 end-to-end tests)
+make test                   # pytest -q (49 end-to-end tests)
 make smoke                  # bash scripts/smoke.sh on SMOKE_PORT=8791
 python3 -m py_compile relay.py   # fast syntax check
 PORT=9000 make run          # alternate port
@@ -143,7 +143,7 @@ third-party packages.
 | Path | What it is |
 | --- | --- |
 | `relay.py` | Entire service: state, guides, HTTP handler, SSE, CLI |
-| `tests/test_relay.py` | 48 end-to-end tests over ephemeral real servers |
+| `tests/test_relay.py` | 49 end-to-end tests over ephemeral real servers |
 | `tests/conftest.py` | Adds repo root to `sys.path` so `import relay` works |
 | `scripts/smoke.sh` | Curl+python3 smoke test; starts its own server on `PORT` (set from `SMOKE_PORT`) |
 | `Makefile` | `run`, `test`, `smoke` targets and overridable variables |
@@ -179,16 +179,20 @@ Key entry points: `main()` for the process, `make_server()` for tests/embedding,
   `--channel-ttl-hours` (168; 0 disables expiry), `--max-channels` (10000),
   `--admin-token` (or `RELAY_ADMIN_TOKEN`; the flag wins), `--log-level`
   (invalid values fall back to `info`). `RELAY_REVISION` reports the build.
-  `--restore-channel TOKEN[:NAME[:NEXT_SEQ]]` (or comma-separated
-  `RELAY_RESTORE_CHANNELS`) recreates known channel URLs at startup; messages
-  are not persisted, so resumed readers see `truncated:true` until their cursor
-  reaches the restore point. There is no config file.
-- **TLS is terminated outside the process.** The service honors
-  `X-Forwarded-Proto`/`X-Forwarded-Host`, or use `--public-url`; reverse proxies
-  must disable buffering for SSE (`proxy_buffering off`).
-- **Guide URLs derive from headers when `--public-url` is unset**
-  (`X-Forwarded-Proto`, `X-Forwarded-Host`, then `Host`). A hostile `Host`
-  header can poison generated links, so pin `--public-url` behind a proxy.
+  `RELAY_PUBLIC_URL` pins generated links to an origin including a path prefix;
+  otherwise `X-Forwarded-Prefix` is honored. `--restore-channel
+  TOKEN[:NAME[:NEXT_SEQ]]` (or comma-separated `RELAY_RESTORE_CHANNELS`)
+  recreates known channel URLs at startup; messages are not persisted, so
+  resumed readers see `truncated:true` until their cursor reaches the restore
+  point. There is no config file.
+- **TLS and path prefixes are handled outside the process.** The service honors
+  `X-Forwarded-Proto`/`X-Forwarded-Host`/`X-Forwarded-Prefix`, or use
+  `--public-url`/`RELAY_PUBLIC_URL`; reverse proxies must disable buffering for
+  SSE (`proxy_buffering off`).
+- **Guide URLs derive from headers when `--public-url`/`RELAY_PUBLIC_URL` is
+  unset** (`X-Forwarded-Proto`, `X-Forwarded-Host`, then `Host`, plus
+  `X-Forwarded-Prefix`). A hostile `Host` header can poison generated links, so
+  pin the public URL behind a proxy.
 - **Docker is the deployment path** (`Dockerfile` + `compose.yaml`; port 8787).
   Node.js is needed only for the vendored epicwolf hooks, not the service.
 

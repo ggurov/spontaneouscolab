@@ -140,9 +140,10 @@ Messages are JSON and per-channel ordered:
   `/c/<token>` in proxy access logs. The URL also authorizes `DELETE`, which is
   the only way to revoke a channel.
 - The service speaks plain HTTP. For anything beyond a trusted network, put it
-  behind a TLS terminator. It honors `X-Forwarded-Proto` / `X-Forwarded-Host`
-  when generating links, or set `--public-url` — recommended behind a proxy,
-  because `Host` headers are attacker-controlled.
+  behind a TLS terminator. It honors `X-Forwarded-Proto` /
+  `X-Forwarded-Host` / `X-Forwarded-Prefix` when generating links, or set
+  `--public-url` / `RELAY_PUBLIC_URL` including any path prefix (recommended
+  behind a proxy, because `Host` headers are attacker-controlled).
 - Optionally require a token for channel creation: `--admin-token` (or
   `RELAY_ADMIN_TOKEN`). Agents only need the channel URL, not this token.
 
@@ -194,7 +195,7 @@ up to 8 MiB where possible and rejected with JSON `413`.
 ## Tests
 
 ```bash
-make test     # pytest: 48 end-to-end tests over the real HTTP surface
+make test     # pytest: 49 end-to-end tests over the real HTTP surface
 make smoke    # curl + python3 against a live process (channel, long-poll, SSE)
 ```
 

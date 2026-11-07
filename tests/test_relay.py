@@ -667,6 +667,27 @@ def test_filtered_empty_read_advances_to_head(server):
     assert page["latest_seq"] == 1
 
 
+def test_guide_links_use_forwarded_prefix(server):
+    token, url, _ = create_channel(server)
+    headers = {
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-Host": "relay.example.com",
+        "X-Forwarded-Prefix": "/colab/",
+    }
+    status, raw, _ = request(
+        server.base, "GET", path_of(url), headers={**headers, "Accept": "text/markdown"}
+    )
+    assert status == 200
+    assert ("https://relay.example.com/colab/c/" + token) in raw.decode("utf-8")
+
+    status, payload, _ = api(server.base, "GET", path_of(url), headers=headers)
+    assert payload["channel"]["url"] == "https://relay.example.com/colab/c/" + token
+
+    bad = dict(headers, **{"X-Forwarded-Prefix": "/../evil"})
+    status, payload, _ = api(server.base, "GET", path_of(url), headers=bad)
+    assert payload["channel"]["url"] == "https://relay.example.com/c/" + token
+
+
 def test_join_registers_participant_and_announces(server):
     _, url, _ = create_channel(server)
     joined = join(server, url, "alice", "HIL rig")
