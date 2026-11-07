@@ -362,6 +362,25 @@ def test_parse_restore_specs():
         relay.parse_restore_specs(["not-a-token"])
 
 
+def test_restored_channel_reports_history_gap(start_server):
+    token = "b" * 32
+    server = start_server(restore=[(token, "restored", 100)])
+    url = server.base + "/c/" + token
+
+    page = read(server, url, since=0)
+    assert page["messages"] == []
+    assert page["latest_seq"] == 99
+    assert page["truncated"] is True
+
+    page = read(server, url, since=99)
+    assert page["truncated"] is False
+
+    post(server, url, text="new")
+    page = read(server, url, since=99)
+    assert [m["seq"] for m in page["messages"]] == [100]
+    assert page["truncated"] is False
+
+
 def test_ring_buffer_truncation(start_server):
     server = start_server(max_messages=3, ttl_seconds=0)
     _, url, _ = create_channel(server)
@@ -481,6 +500,27 @@ def test_waiter_released_on_disconnect(server):
             return
         time.sleep(0.1)
     raise AssertionError("waiter count did not drop after client disconnect")
+
+
+def test_shutdown_returns_retryable_503(server):
+    _, url, _ = create_channel(server)
+    result = {}
+
+    def waiter():
+        status, payload, _ = api(
+            server.base, "GET", path_of(url) + "/messages?since=0&wait=30"
+        )
+        result["status"] = status
+        result["payload"] = payload
+
+    thread = threading.Thread(target=waiter, daemon=True)
+    thread.start()
+    wait_for_waiters(server, url)
+    server.relay.shutdown()
+    thread.join(timeout=5)
+
+    assert result["status"] == 503
+    assert "restarting" in result["payload"]["error"]
 
 
 def test_delete_channel_wakes_waiter(server):

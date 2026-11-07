@@ -18,6 +18,7 @@ import os
 import re
 import secrets
 import select
+import signal
 import socket
 import threading
 import time
@@ -205,6 +206,7 @@ class Relay:
         self.admin_token = admin_token or None
         self.revision = (revision or os.environ.get("RELAY_REVISION") or "dev").strip() or "dev"
         self.started_mono = time.monotonic()
+        self.stopping = False
         for token, name, next_seq in restore or []:
             if token in self.channels or len(self.channels) >= self.max_channels:
                 continue
@@ -351,6 +353,8 @@ class Relay:
                 while True:
                     if channel.closed:
                         raise ApiError(410, "channel closed")
+                    if self.stopping:
+                        raise ApiError(503, "server restarting; retry")
                     messages = channel.snapshot(since, as_name, limit)
                     if messages:
                         break
@@ -383,7 +387,10 @@ class Relay:
             "cursor": messages[-1]["seq"] if messages else min(since, latest),
             "latest_seq": latest,
             "oldest_seq": oldest,
-            "truncated": oldest is not None and since < oldest - 1,
+            "truncated": (
+                since < oldest - 1 if oldest is not None
+                else latest > 0 and since < latest
+            ),
         }
 
     def health(self) -> dict[str, Any]:
@@ -402,6 +409,13 @@ class Relay:
                     "max_wait_s": MAX_WAIT,
                 },
             }
+
+    def shutdown(self) -> None:
+        """Wake parked long-polls/SSE so they can report a retryable 503."""
+        with self.lock:
+            self.stopping = True
+            for channel in self.channels.values():
+                channel.cond.notify_all()
 
     def check_admin(self, provided: str | None) -> None:
         if not self.admin_token:
@@ -526,7 +540,8 @@ Always continue from the returned `cursor`. `wait` is the effective request
 `as` filters out messages addressed to a different participant with `to`, but a
 sender always sees its own messages. A `since` beyond `latest_seq` is clamped to
 the head, so a stale cursor recovers. `truncated:true` means older messages were
-dropped from the ring buffer.
+dropped from the ring buffer or a restart skipped history (a restored channel
+reports it until your cursor reaches the restore point).
 
 Read the newest retained messages in one call (no long-poll), e.g. when joining:
 
@@ -1031,6 +1046,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             last_write = time.monotonic()
             while True:
                 with self.relay.lock:
+                    if self.relay.stopping:
+                        break
                     messages = channel.snapshot(since, as_name, MAX_LIMIT)
                     if not messages and not channel.closed:
                         channel.cond.wait(SSE_HEARTBEAT)
@@ -1266,7 +1283,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action="append",
         default=[],
         metavar="TOKEN[:NAME[:NEXT_SEQ]]",
-        help="recreate a channel token at startup (repeatable; env: RELAY_RESTORE_CHANNELS)",
+        help="recreate a channel token at startup (repeatable; env: RELAY_RESTORE_CHANNELS; history is not restored)",
     )
     parser.add_argument("--log-level", default="info", help="debug, info, warning, error")
     return parser.parse_args(argv)
@@ -1300,12 +1317,20 @@ def main(argv: Iterable[str] | None = None) -> None:
     base = relay.base_url or "http://%s:%d" % (display_host, port)
     LOG.info("Agent Relay listening on %s (create: POST %s/channels)", base, base)
 
-    threading.Thread(target=gc_loop, args=(relay,), name="relay-gc", daemon=True).start()
+    def _drain(signum, _frame):
+        LOG.info("received signal %s; draining", signum)
+        relay.shutdown()
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _drain)
+    signal.signal(signal.SIGINT, _drain)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
+        relay.shutdown()
         LOG.info("shutting down")
     finally:
+        time.sleep(0.5)  # let parked handlers write their 503 before close
         httpd.server_close()
 
 
