@@ -357,6 +357,7 @@ class Relay:
                 "ok": True,
                 "revision": self.revision,
                 "channels": len(self.channels),
+                "uptime_s": round(time.monotonic() - self.started_mono, 1),
                 "limits": {
                     "messages_per_channel": self.max_messages,
                     "max_channels": self.max_channels,

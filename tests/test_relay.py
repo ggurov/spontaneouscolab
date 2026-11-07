@@ -799,6 +799,7 @@ def test_health(server):
     assert status == 200
     assert payload["ok"] is True
     assert payload["channels"] == 0
+    assert isinstance(payload["uptime_s"], (int, float))
     create_channel(server)
     status, payload, _ = api(server.base, "GET", "/healthz")
     assert payload["channels"] == 1
