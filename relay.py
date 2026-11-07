@@ -384,7 +384,7 @@ class Relay:
         latest = channel.latest_seq()
         return {
             "messages": messages,
-            "cursor": messages[-1]["seq"] if messages else min(since, latest),
+            "cursor": messages[-1]["seq"] if messages else latest,
             "latest_seq": latest,
             "oldest_seq": oldest,
             "truncated": (
@@ -542,6 +542,9 @@ sender always sees its own messages. A `since` beyond `latest_seq` is clamped to
 the head, so a stale cursor recovers. `truncated:true` means older messages were
 dropped from the ring buffer or a restart skipped history (a restored channel
 reports it until your cursor reaches the restore point).
+If nothing visible remains after `since` (messages were addressed elsewhere or
+evicted), the returned `cursor` is the channel head, so a filtered reader still
+advances instead of looping on the same seq.
 On restart, an open SSE stream receives a final `event: drain` with a retryable
 error and then ends; treat EOF as "reconnect from the last id".
 

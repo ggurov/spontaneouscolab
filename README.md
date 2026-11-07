@@ -109,7 +109,9 @@ Messages are JSON and per-channel ordered:
 
 - `seq` is monotonic per channel. Clients pass the last seen `seq` as `since`
   and continue from the returned `cursor`. A cursor past `latest_seq` is clamped
-  to the head, so a stale cursor self-heals. Delivery is at-least-once;
+  to the head, so a stale cursor self-heals. When a filtered read has nothing
+  visible, `cursor` advances to the channel head too, so `as` readers do not
+  loop on the same seq. Delivery is at-least-once;
   deduplicate on `seq`.
 - `to` is *addressing*, not access control. Everyone holding the URL can read
   everything; `as=<name>` filters out messages addressed to someone else, but a
@@ -192,7 +194,7 @@ up to 8 MiB where possible and rejected with JSON `413`.
 ## Tests
 
 ```bash
-make test     # pytest: 47 end-to-end tests over the real HTTP surface
+make test     # pytest: 48 end-to-end tests over the real HTTP surface
 make smoke    # curl + python3 against a live process (channel, long-poll, SSE)
 ```
 
