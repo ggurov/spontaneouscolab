@@ -76,7 +76,7 @@ The repo carries a vendored `.wolf/` memory tree and `.claude/` hooks from
 
 ```bash
 make run                    # python3 relay.py --host 127.0.0.1 --port 8787
-make test                   # pytest -q (30 end-to-end tests)
+make test                   # pytest -q (38 end-to-end tests)
 make smoke                  # bash scripts/smoke.sh on SMOKE_PORT=8791
 python3 -m py_compile relay.py   # fast syntax check
 PORT=9000 make run          # alternate port
@@ -116,12 +116,16 @@ third-party packages.
   outside it. Blocking work in a post handler must stay short.
 - **Validation and limits.** Reuse `_clean_name` (1–64 printable characters for
   `sender`, `to`, join `name`, `role`), `_int_query`, `_wait_query`, and the
-  `MAX_*` constants. Oversized bodies close the connection (413); oversized
-  message text/data is rejected before mutation.
+  `MAX_*` constants. Oversized bodies are drained up to 8 MiB where possible
+  and rejected with JSON 413; oversized message text/data is rejected before
+  mutation.
 - **Wire schema is stable.** Messages always carry `seq`, `ts`, `sender`,
   `kind`, `text`, `to`, `reply_to`, `data`. `to` is addressing, not access
-  control; all URL holders can read everything. Extend with new `kind` values
-  rather than changing or reusing fields.
+  control; all URL holders can read everything. A reader using `as=<name>` sees
+  broadcasts plus messages addressed to it plus its own messages, even when its
+  own message is addressed elsewhere. Cursors past `latest_seq` are clamped to
+  the head. Extend with new `kind` values rather than changing or reusing
+  fields.
 - **Self-documenting behavior is part of the API.** Any endpoint, limit, flag,
   or semantic change must update `SERVICE_GUIDE`, `CHANNEL_GUIDE`, their JSON
   variants, and `README.md`. Guides use `%`-formatting with `%(key)s`
@@ -138,7 +142,7 @@ third-party packages.
 | Path | What it is |
 | --- | --- |
 | `relay.py` | Entire service: state, guides, HTTP handler, SSE, CLI |
-| `tests/test_relay.py` | 30 end-to-end tests over ephemeral real servers |
+| `tests/test_relay.py` | 38 end-to-end tests over ephemeral real servers |
 | `tests/conftest.py` | Adds repo root to `sys.path` so `import relay` works |
 | `scripts/smoke.sh` | Curl+python3 smoke test; starts its own server on `PORT` (set from `SMOKE_PORT`) |
 | `Makefile` | `run`, `test`, `smoke` targets and overridable variables |
@@ -161,8 +165,10 @@ Key entry points: `main()` for the process, `make_server()` for tests/embedding,
 - **Python 3.9+**, standard library only; no requirements file, virtualenv, or
   package manager is needed for runtime. `pytest` is the only dev tool.
 - **HTTP/1.1** with keep-alive and one thread per connection; long-poll is
-  capped at 60 s and the handler socket timeout is 120 s. Request bodies
-  require `Content-Length`; chunked uploads are not supported.
+  capped at 60 s and the handler socket timeout is 120 s. Bodies require
+  `Content-Length`; chunked uploads are not supported. `TCP_NODELAY` is on
+  (`disable_nagle_algorithm`) to avoid ~40 ms keep-alive stalls; SSE honors
+  `Last-Event-ID` and emits `retry: 3000`.
 - **State is in memory.** A restart forgets all channels; channels expire after
   `--channel-ttl-hours` without a new message (reads do not refresh the clock)
   and are capped at `--max-messages` retained messages. Do not assume
@@ -193,12 +199,14 @@ Key entry points: `main()` for the process, `make_server()` for tests/embedding,
   `server.base` + `path_of(url)`, keep one server/channel set per test, and
   close SSE connections in `finally`.
 - The suite proves: capability isolation (wrong/absent token → 404), cursor and
-  truncation semantics, ring-buffer eviction, long-poll wakeup/timeout/waiter
-  counts, waiter wakeup on channel deletion, SSE history/live delivery and `as`
-  filtering, `to` addressing, join/presence, reply/data round-trip, TTL expiry,
-  capacity limits, forwarded-header link generation, plain-text and JSON-sniffed
-  posts, validation errors, admin-token gating, delete, HEAD/OPTIONS/health, and
-  that the guides reflect effective limits.
+  truncation semantics, stale-cursor clamping, ring-buffer eviction, long-poll
+  wakeup/timeout/waiter counts, waiter release on client disconnect and channel
+  deletion, SSE history/live delivery, `as` filtering and `Last-Event-ID`
+  resume, tail reads (`last=N`), `to` addressing and sender visibility,
+  join/presence, reply/data round-trip, TTL expiry, capacity limits,
+  forwarded-header link generation, plain-text and JSON-sniffed posts, JSON error
+  positions, clean oversized-body 413s, auto-named channels, admin-token gating,
+  delete, HEAD/OPTIONS/health, and that the guides reflect effective limits.
 - Add tests at the HTTP boundary with the existing helpers (`start_server`,
   `api`, `post`, `read`, `join`, `sse`, `read_sse_event`, `wait_for_waiters`);
   assert both status code and payload. For timing-sensitive cases follow the
