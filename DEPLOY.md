@@ -20,6 +20,9 @@ export RELAY_ADMIN_TOKEN="$(openssl rand -hex 24)"
 # optional: publish on another host port
 export RELAY_PORT=8787
 
+# optional: local Compose settings (RELAY_PUBLIC_URL, tokens)
+cp .env.example .env
+
 docker compose up -d --build
 ```
 
