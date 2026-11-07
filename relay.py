@@ -17,13 +17,15 @@ import logging
 import os
 import re
 import secrets
+import select
+import socket
 import threading
 import time
 import urllib.parse
 from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 LOG = logging.getLogger("agent-relay")
 
@@ -35,12 +37,13 @@ DEFAULT_TTL_HOURS = 168.0
 DEFAULT_MAX_CHANNELS = 10_000
 MAX_MESSAGE_BYTES = 64 * 1024
 MAX_BODY_BYTES = 1024 * 1024
+MAX_DRAIN_BYTES = 8 * 1024 * 1024
 MAX_SENDER_LEN = 64
 MAX_WAIT = 60.0
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 1000
 SSE_HEARTBEAT = 15.0
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +78,10 @@ class ApiError(Exception):
         self.headers = headers or {}
 
 
+
+class ClientDisconnected(Exception):
+    """The HTTP client closed its connection while a long-poll was waiting."""
+
 # ---------------------------------------------------------------------------
 # state
 
@@ -103,18 +110,31 @@ class Channel:
     def latest_seq(self) -> int:
         return self.next_seq - 1
 
+    @staticmethod
+    def _visible(message: dict[str, Any], as_name: str | None) -> bool:
+        """True when a reader identified as ``as_name`` may see the message."""
+        if not as_name:
+            return True
+        recipient = message["to"]
+        return not recipient or recipient == as_name or message["sender"] == as_name
+
     def snapshot(self, since: int, as_name: str | None, limit: int) -> list[dict[str, Any]]:
         """Messages with seq > since, optionally filtered by recipient."""
         out: list[dict[str, Any]] = []
         for message in self.messages:
             if message["seq"] <= since:
                 continue
-            if as_name and message["to"] and message["to"] != as_name:
+            if not self._visible(message, as_name):
                 continue
             out.append(message)
             if len(out) >= limit:
                 break
         return out
+
+    def tail(self, as_name: str | None, limit: int) -> list[dict[str, Any]]:
+        """Newest visible messages, oldest first."""
+        visible = [message for message in self.messages if self._visible(message, as_name)]
+        return visible[-limit:]
 
     def info(self, ttl_seconds: float) -> dict[str, Any]:
         oldest = self.oldest_seq()
@@ -166,7 +186,8 @@ class Relay:
             if len(self.channels) >= self.max_channels:
                 raise ApiError(503, "channel limit reached; try again later")
             token = secrets.token_hex(16)
-            channel = Channel(token, name.strip()[:128], self.max_messages, self.lock)
+            display_name = name.strip()[:128] or "channel-" + token[:8]
+            channel = Channel(token, display_name, self.max_messages, self.lock)
             self.channels[token] = channel
             LOG.info("channel created: token=%s name=%r", mask_tokens(token), channel.name)
             return channel
@@ -283,6 +304,7 @@ class Relay:
         as_name: str | None,
         wait_seconds: float,
         limit: int,
+        cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Long-poll: return once a message is available or the wait expires."""
         deadline = time.monotonic() + wait_seconds
@@ -298,17 +320,31 @@ class Relay:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
-                    channel.cond.wait(remaining)
+                    channel.cond.wait(min(remaining, 1.0))
+                    if cancel is not None and cancel():
+                        raise ClientDisconnected()
             finally:
                 channel.waiters -= 1
             return self.page(channel, messages, since)
 
+    def tail(self, channel: Channel, *, as_name: str | None, limit: int) -> dict[str, Any]:
+        """Newest retained page; used by the non-blocking ``last`` read mode."""
+        with self.lock:
+            if channel.closed:
+                raise ApiError(410, "channel closed")
+            messages = channel.tail(as_name, limit)
+            page = self.page(channel, messages, 0)
+            if not messages:
+                page["cursor"] = channel.latest_seq()
+            return page
+
     def page(self, channel: Channel, messages: list[dict[str, Any]], since: int) -> dict[str, Any]:
         oldest = channel.oldest_seq()
+        latest = channel.latest_seq()
         return {
             "messages": messages,
-            "cursor": messages[-1]["seq"] if messages else since,
-            "latest_seq": channel.latest_seq(),
+            "cursor": messages[-1]["seq"] if messages else min(since, latest),
+            "latest_seq": latest,
             "oldest_seq": oldest,
             "truncated": oldest is not None and since < oldest - 1,
         }
@@ -356,6 +392,9 @@ curl -sS -X POST %(base)s/channels \\
 The response contains a `url` such as `%(base)s/c/<token>`. That URL is the
 capability: **anyone holding it can read and post; nobody else can.** Send it to
 the other agent over a channel you already trust.
+
+The optional `name` is for humans; if omitted, the channel is named
+`channel-<token-prefix>`.
 
 ## Then
 
@@ -441,10 +480,25 @@ Long-poll (recommended; returns when a message arrives or `wait` seconds pass):
 curl -sS '%(url)s/messages?since=%(cursor)d&wait=60&as=my-agent'
 ```
 
-Response: `{"messages":[...],"cursor":N,"latest_seq":N,"oldest_seq":N,"truncated":false}`.
-Always continue from the returned `cursor`. `as` filters out messages addressed
-to a different participant with `to`. `truncated:true` means older messages were
+Response: `{"messages":[...],"cursor":N,"latest_seq":N,"oldest_seq":N,"truncated":false,"wait":N,"wait_elapsed":N}`.
+Always continue from the returned `cursor`. `wait` is the effective request
+(capped at 60 s) and `wait_elapsed` is how long the poll actually blocked.
+`as` filters out messages addressed to a different participant with `to`, but a
+sender always sees its own messages. A `since` beyond `latest_seq` is clamped to
+the head, so a stale cursor recovers. `truncated:true` means older messages were
 dropped from the ring buffer.
+
+Read the newest retained messages in one call (no long-poll), e.g. when joining:
+
+```
+curl -sS '%(url)s/messages?last=50&as=my-agent'
+```
+
+`limit` caps a page at 100 by default (maximum 1000); `last` is capped the same
+way. Join announcements are broadcast and consume retention slots. SSE sends
+`retry: 3000` and, when `Last-Event-ID` is present, resumes after that seq.
+`GET %(url)s?format=json` (or `Accept: application/json`) returns this status as
+JSON.
 
 Streaming alternative (server-sent events):
 
@@ -466,9 +520,10 @@ curl -sS -X POST '%(url)s/messages?sender=my-agent' -d 'hello'
 ```
 
 Sending requires `sender`; `text` and/or `data` must carry content. `to` is
-addressing, not access control: everyone with the URL can read everything.
-Use `reply_to` with a `seq` to thread a reply. The response reports how many
-long-poll readers were waiting.
+addressing, not access control: everyone with the URL can read everything. With
+`as=<name>`, messages addressed to someone else are hidden, but the sender
+always sees its own. Use `reply_to` with a `seq` to thread a reply. The response
+reports how many long-poll readers were waiting.
 
 ### Message shape
 
@@ -488,8 +543,8 @@ long-poll readers were waiting.
 ## Rules of the road
 
 - Continue from `cursor`; deduplicate on `seq`.
-- Messages are held in memory only: last %(retained_max)d per channel, channels
-  expire after %(ttl)s idle, and a service restart clears everything.
+- Messages are held in memory only: last %(retained_max)d per channel;
+  %(expiry_phrase)s, and a service restart clears everything.
 - Maximum message size: %(message_kib)d KiB.
 - This channel URL is a secret. Do not paste it into logs, tickets, or chat
   history you would not trust with the conversation.
@@ -522,6 +577,7 @@ def channel_guide(channel: Channel, base: str, ttl_seconds: float, max_messages:
         "cursor": info["cursor"],
         "oldest": info["oldest_seq"] if info["oldest_seq"] is not None else "-",
         "ttl": ttl,
+        "expiry_phrase": _expiry_phrase(ttl_seconds),
         "retained_max": max_messages,
         "message_kib": MAX_MESSAGE_BYTES // 1024,
     }
@@ -567,8 +623,11 @@ def channel_guide_json(channel: Channel, base: str, ttl_seconds: float) -> dict[
 
 class RelayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "AgentRelay/1.0"
+    server_version = "AgentRelay/2.0"
     timeout = 120
+    # Headers and body are separate writes; TCP_NODELAY avoids Nagle + delayed
+    # ACK stalls (~40 ms) on keep-alive connections.
+    disable_nagle_algorithm = True
 
     # -- plumbing -----------------------------------------------------------
 
@@ -591,6 +650,19 @@ class RelayHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:  # noqa: N802
         self._dispatch(self._handle_delete)
 
+
+    def do_PUT(self) -> None:  # noqa: N802
+        self._method_not_allowed()
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        self._method_not_allowed()
+
+    def _method_not_allowed(self) -> None:
+        self._send_json(
+            405,
+            {"error": "method not allowed"},
+            extra={"Allow": "GET, HEAD, POST, DELETE, OPTIONS"},
+        )
     def handle_one_request(self) -> None:
         self._headers_sent = False
         self._body_read = False
@@ -610,6 +682,8 @@ class RelayHandler(BaseHTTPRequestHandler):
     def _dispatch(self, handler) -> None:
         try:
             handler()
+        except ClientDisconnected:
+            self.close_connection = True
         except ApiError as exc:
             if self.command == "POST" and not getattr(self, "_body_read", False):
                 self.close_connection = True
@@ -658,15 +732,31 @@ class RelayHandler(BaseHTTPRequestHandler):
         except ValueError:
             self.close_connection = True
             raise ApiError(400, "invalid Content-Length")
-        if length < 0 or length > MAX_BODY_BYTES:
+        if length < 0:
             self.close_connection = True
-            raise ApiError(413, "request body too large")
+            raise ApiError(400, "invalid Content-Length")
+        if length > MAX_BODY_BYTES:
+            self._discard_body(length)
+            raise ApiError(413, "request body is %d bytes; limit is %d" % (length, MAX_BODY_BYTES))
         body = self.rfile.read(length)
         if len(body) != length:
             self.close_connection = True
             raise ApiError(400, "truncated request body")
         self._body_read = True
         return body
+
+    def _discard_body(self, length: int) -> None:
+        """Drain an oversized body so the client can read the 413 response."""
+        remaining = min(length, MAX_DRAIN_BYTES)
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+        if length > MAX_DRAIN_BYTES:
+            self.close_connection = True
+        else:
+            self._body_read = True
 
     def _base_url(self) -> str:
         if self.relay.base_url:
@@ -686,8 +776,10 @@ class RelayHandler(BaseHTTPRequestHandler):
         return parts, query
 
     def _channel(self, parts: list[str]) -> Channel:
-        if len(parts) < 2 or parts[0] != "c" or not TOKEN_RE.match(parts[1]):
+        if len(parts) < 2 or parts[0] != "c":
             raise ApiError(404, "unknown endpoint")
+        if not TOKEN_RE.match(parts[1]):
+            raise ApiError(404, "unknown channel")
         return self.relay.get_channel(parts[1])
 
     def _wants_json(self, query: dict[str, list[str]]) -> bool:
@@ -772,12 +864,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self._send(200, text.encode("utf-8"), "text/markdown; charset=utf-8")
             return
         if rest == ["status"]:
-            base = self._base_url()
             with self.relay.lock:
-                channel_payload = channel_guide_json(channel, base, self.relay.ttl_seconds)
+                channel_info = channel.info(self.relay.ttl_seconds)
+                participants = channel.participant_list()
             self._send_json(200, {
-                "channel": channel_payload["channel"],
-                "participants": channel_payload["participants"],
+                "channel": channel_info,
+                "participants": participants,
             })
             return
         if rest == ["messages"]:
@@ -801,12 +893,51 @@ class RelayHandler(BaseHTTPRequestHandler):
         limit = min(self._int_query(query, "limit", DEFAULT_LIMIT, 1), MAX_LIMIT)
         wait_seconds = self._wait_query(query)
         as_name = self._name_query(query, "as")
-        page = self.relay.wait(channel, since=since, as_name=as_name, wait_seconds=wait_seconds, limit=limit)
+        last_raw = (query.get("last") or [None])[0]
+        if last_raw not in (None, ""):
+            last = min(self._int_query(query, "last", DEFAULT_LIMIT, 1), MAX_LIMIT)
+            started = time.monotonic()
+            page = self.relay.tail(channel, as_name=as_name, limit=last)
+            page["wait"] = 0.0
+            page["wait_elapsed"] = round(time.monotonic() - started, 3)
+            self._send_json(200, page)
+            return
+        started = time.monotonic()
+        page = self.relay.wait(
+            channel,
+            since=since,
+            as_name=as_name,
+            wait_seconds=wait_seconds,
+            limit=limit,
+            cancel=self._client_gone,
+        )
         page["wait"] = wait_seconds
+        page["wait_elapsed"] = round(time.monotonic() - started, 3)
         self._send_json(200, page)
+
+    def _client_gone(self) -> bool:
+        """Non-blocking EOF probe for a long-poll client that disconnected."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+        except (OSError, ValueError):
+            return True
+        if not readable:
+            return False
+        try:
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (BlockingIOError, InterruptedError):
+            return False
+        except OSError:
+            return True
 
     def _events(self, channel: Channel, query: dict[str, list[str]]) -> None:
         since = self._int_query(query, "since", 0, 0)
+        last_event_id = self.headers.get("Last-Event-ID")
+        if last_event_id:
+            try:
+                since = max(since, int(last_event_id))
+            except ValueError:
+                raise ApiError(400, "Last-Event-ID must be an integer")
         as_name = self._name_query(query, "as")
         self._headers_sent = True
         self.send_response(200)
@@ -820,7 +951,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         try:
-            self.wfile.write(b": connected\n\n")
+            self.wfile.write(b": connected\nretry: 3000\n\n")
             self.wfile.flush()
             last_write = time.monotonic()
             while True:
@@ -879,7 +1010,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             try:
                 payload = json.loads(body)
             except json.JSONDecodeError as exc:
-                raise ApiError(400, "invalid JSON: %s" % exc.msg)
+                raise ApiError(400, "invalid JSON: %s" % exc)
             if not isinstance(payload, dict):
                 raise ApiError(400, "JSON body must be an object")
             name = self._clean_name(payload.get("name"), "name", required=False) or ""
@@ -903,13 +1034,14 @@ class RelayHandler(BaseHTTPRequestHandler):
         role = self._clean_name(payload.get("role"), "role", required=False)
         message, participant = self.relay.join(channel, name=name, role=role)
         with self.relay.lock:
-            channel_json = channel_guide_json(channel, self._base_url(), self.relay.ttl_seconds)
+            channel_info = channel.info(self.relay.ttl_seconds)
+            participants = channel.participant_list()
         self._send_json(200, {
             "ok": True,
             "participant": participant,
             "cursor": message["seq"],
-            "channel": channel_json["channel"],
-            "participants": channel_json["participants"],
+            "channel": channel_info,
+            "participants": participants,
         })
 
     def _post_message(self, channel: Channel, query: dict[str, list[str]]) -> None:
@@ -920,15 +1052,19 @@ class RelayHandler(BaseHTTPRequestHandler):
             try:
                 parsed = json.loads(raw or b"{}")
             except json.JSONDecodeError as exc:
-                raise ApiError(400, "invalid JSON: %s" % exc.msg)
+                raise ApiError(400, "invalid JSON: %s" % exc)
             if not isinstance(parsed, dict):
                 raise ApiError(400, "JSON body must be an object")
             payload = parsed
-        elif content_type != "text/plain" and raw.lstrip().startswith(b"{"):
+        elif raw.lstrip().startswith(b"{"):
             try:
                 parsed = json.loads(raw)
             except json.JSONDecodeError:
-                raise ApiError(400, "body starts with '{' but is not valid JSON; send plain text with Content-Type: text/plain")
+                raise ApiError(
+                    400,
+                    "body starts with '{' but is not valid JSON; use Content-Type: application/json "
+                    "or send text that does not start with '{'",
+                )
             if not isinstance(parsed, dict):
                 raise ApiError(400, "JSON body must be an object")
             payload = parsed
@@ -951,10 +1087,13 @@ class RelayHandler(BaseHTTPRequestHandler):
         data = payload.get("data")
         if not text and data is None:
             raise ApiError(400, "text or data is required")
-        if len(text.encode("utf-8")) > MAX_MESSAGE_BYTES:
-            raise ApiError(413, "text exceeds %d KiB" % (MAX_MESSAGE_BYTES // 1024))
-        if data is not None and len(json.dumps(data, ensure_ascii=False).encode("utf-8")) > MAX_MESSAGE_BYTES:
-            raise ApiError(413, "data exceeds %d KiB" % (MAX_MESSAGE_BYTES // 1024))
+        text_bytes = len(text.encode("utf-8"))
+        if text_bytes > MAX_MESSAGE_BYTES:
+            raise ApiError(413, "text is %d bytes; limit is %d" % (text_bytes, MAX_MESSAGE_BYTES))
+        if data is not None:
+            data_bytes = len(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+            if data_bytes > MAX_MESSAGE_BYTES:
+                raise ApiError(413, "data is %d bytes; limit is %d" % (data_bytes, MAX_MESSAGE_BYTES))
 
         message, waiters = self.relay.post(
             channel, sender=sender, text=text, to=to, reply_to=reply_to, data=data
@@ -993,7 +1132,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(body)
         except json.JSONDecodeError as exc:
-            raise ApiError(400, "invalid JSON: %s" % exc.msg)
+            raise ApiError(400, "invalid JSON: %s" % exc)
         if not isinstance(payload, dict):
             raise ApiError(400, "JSON body must be an object")
         return payload

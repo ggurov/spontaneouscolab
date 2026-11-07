@@ -82,8 +82,8 @@ runbook, TLS proxy examples, and operations.
 | `GET` | `/c/<token>` | Channel guide + live status (self-documenting URL) |
 | `POST` | `/c/<token>/join` | Register a participant, post a `kind:"join"` announcement |
 | `POST` | `/c/<token>/messages` | Send `{sender, text, to?, reply_to?, data?}` |
-| `GET` | `/c/<token>/messages` | Read: `since`, `wait` (long-poll, max 60 s), `as`, `limit` (default 100, max 1000) |
-| `GET` | `/c/<token>/events` | Stream messages as server-sent events (`since`, `as`) |
+| `GET` | `/c/<token>/messages` | Read: `since`, `wait` (long-poll, max 60 s), `last=N` (newest page), `as`, `limit` (default 100, max 1000) |
+| `GET` | `/c/<token>/events` | Stream as SSE (`since`, `as`); resumes from `Last-Event-ID`, sends `retry: 3000` |
 | `GET` | `/c/<token>/status` | Participants and counters as JSON |
 | `DELETE` | `/c/<token>` | Close the channel (204) |
 | `GET` | `/healthz` | Liveness, channel count, configured limits |
@@ -104,16 +104,24 @@ Messages are JSON and per-channel ordered:
 ```
 
 - `seq` is monotonic per channel. Clients pass the last seen `seq` as `since`
-  and continue from the returned `cursor`. Delivery is at-least-once; deduplicate
-  on `seq`.
+  and continue from the returned `cursor`. A cursor past `latest_seq` is clamped
+  to the head, so a stale cursor self-heals. Delivery is at-least-once;
+  deduplicate on `seq`.
 - `to` is *addressing*, not access control. Everyone holding the URL can read
-  everything; `as=<name>` filters out messages addressed to someone else.
+  everything; `as=<name>` filters out messages addressed to someone else, but a
+  sender always sees its own messages.
 - `reply_to` threads a reply to a `seq`; `data` carries arbitrary JSON.
-- `kind` is `message` or `join`.
+- `wait` is the effective long-poll request (capped at 60 s); `wait_elapsed`
+  reports how long the call actually blocked.
+- `kind` is `message` or `join`. Join announcements are broadcast and consume
+  retention slots.
+- `?last=N` (with optional `as`) returns the newest `N` retained messages
+  without long-polling — useful for catching up on join.
 - `sender`, `to`, and join `name`/`role` are 1–64 printable characters; channel
-  names follow the same rule.
+  names follow the same rule, and an omitted name becomes
+  `channel-<token-prefix>`.
 - Posts accept `Content-Type: application/json`, or plain text with
-  `?sender=<name>` (curl's default form content type is sniffed for JSON).
+  `?sender=<name>`; a body starting with `{` is parsed as JSON.
 
 ## Security model
 
@@ -172,17 +180,19 @@ Everything is in memory, on purpose: it is a conversation relay, not an archive.
 
 A restart forgets all channels and messages. Expired channels are removed by a
 background sweep; new requests to a dead URL get `404`, an in-flight long-poll
-gets `410`, and an open SSE stream ends.
+gets `410`, and an open SSE stream ends. Oversized request bodies are drained
+up to 8 MiB where possible and rejected with JSON `413`.
 
 ## Tests
 
 ```bash
-make test     # pytest: 30 end-to-end tests over the real HTTP surface
+make test     # pytest: 38 end-to-end tests over the real HTTP surface
 make smoke    # curl + python3 against a live process (channel, long-poll, SSE)
 ```
 
 The suite covers capability isolation, cursor/truncation semantics, long-poll
-wakeup and timeout, SSE history and live delivery, `as` filtering, join/presence,
+wakeup/timeout/disconnect, SSE history, live delivery, `Last-Event-ID` resume and
+`as` filtering, tail reads, `to` addressing and sender visibility, join/presence,
 idle-channel expiry, capacity limits, proxy-derived guide links, validation,
 admin-token gating, and channel deletion.
 

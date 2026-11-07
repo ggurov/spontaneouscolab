@@ -2,6 +2,7 @@
 
 import http.client
 import json
+import socket
 import threading
 import time
 import urllib.error
@@ -113,12 +114,12 @@ def join(server, url, name, role=None):
     return payload
 
 
-def sse(server, url, since=0, as_name=None):
+def sse(server, url, since=0, as_name=None, headers=None):
     query = "/events?since=%d" % since
     if as_name:
         query += "&as=" + urllib.parse.quote(as_name)
     connection = http.client.HTTPConnection(server.host, server.port, timeout=10)
-    connection.request("GET", path_of(url) + query)
+    connection.request("GET", path_of(url) + query, headers=headers or {})
     response = connection.getresponse()
     return connection, response
 
@@ -230,6 +231,14 @@ def test_channel_name_must_be_single_line(server):
     assert "name" in payload["error"]
 
 
+def test_unnamed_channel_gets_generated_name(server):
+    status, payload, _ = api(server.base, "POST", "/channels", json_body={})
+    assert status == 201
+    name = payload["channel"]["name"]
+    assert name.startswith("channel-")
+    assert len(name) == len("channel-") + 8
+
+
 def test_channel_creation_requires_admin_token_when_configured(start_server):
     server = start_server(admin_token="s3cret")
     status, payload, _ = api(server.base, "POST", "/channels", json_body={})
@@ -286,6 +295,19 @@ def test_cursor_semantics(server):
     assert page["cursor"] == 3
 
 
+def test_cursor_ahead_of_head_is_clamped(server):
+    _, url, _ = create_channel(server)
+    post(server, url, text="one")
+
+    page = read(server, url, since=999999)
+    assert page["messages"] == []
+    assert page["cursor"] == 1
+
+    post(server, url, text="two")
+    page = read(server, url, since=page["cursor"])
+    assert [m["text"] for m in page["messages"]] == ["two"]
+
+
 def test_limit_and_cursor_resume(server):
     _, url, _ = create_channel(server)
     for index in range(5):
@@ -297,6 +319,20 @@ def test_limit_and_cursor_resume(server):
 
     second = read(server, url, since=first["cursor"], limit=2)
     assert [m["seq"] for m in second["messages"]] == [3, 4]
+
+
+def test_tail_returns_newest_messages(server):
+    _, url, _ = create_channel(server)
+    for index in range(5):
+        post(server, url, text="m%d" % index)
+
+    status, payload, _ = api(server.base, "GET", path_of(url) + "/messages?last=2")
+    assert status == 200
+    assert [m["text"] for m in payload["messages"]] == ["m3", "m4"]
+    assert payload["cursor"] == 5
+    assert payload["latest_seq"] == 5
+    assert payload["oldest_seq"] == 1
+    assert payload["truncated"] is False
 
 
 def test_ring_buffer_truncation(start_server):
@@ -385,6 +421,41 @@ def test_long_poll_reports_waiters(server):
     assert result["payload"]["messages"][0]["text"] == "after-wait"
 
 
+def test_wait_reports_effective_and_elapsed(server):
+    _, url, _ = create_channel(server)
+    post(server, url, text="ready")
+
+    page = read(server, url, since=0, wait=5)
+    assert page["wait"] == 5
+    assert 0 <= page["wait_elapsed"] < 2
+
+    page = read(server, url, since=page["cursor"], wait=0.3)
+    assert page["messages"] == []
+    assert page["wait"] == 0.3
+    assert 0.2 <= page["wait_elapsed"] < 2
+
+
+def test_waiter_released_on_disconnect(server):
+    _, url, _ = create_channel(server)
+    sock = socket.create_connection((server.host, server.port), timeout=5)
+    try:
+        path = path_of(url) + "/messages?since=0&wait=30"
+        request_text = "GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" % path
+        sock.sendall(request_text.encode("ascii"))
+        wait_for_waiters(server, url)
+    finally:
+        sock.close()
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        status, payload, _ = api(server.base, "GET", path_of(url) + "/status")
+        assert status == 200
+        if payload["channel"]["waiters"] == 0:
+            return
+        time.sleep(0.1)
+    raise AssertionError("waiter count did not drop after client disconnect")
+
+
 def test_delete_channel_wakes_waiter(server):
     _, url, _ = create_channel(server)
     result = {}
@@ -427,6 +498,22 @@ def test_sse_delivers_history_and_live_messages(server):
         connection.close()
 
 
+def test_sse_resumes_from_last_event_id(server):
+    _, url, _ = create_channel(server)
+    post(server, url, text="one")
+    post(server, url, text="two")
+
+    connection, response = sse(server, url, since=0, headers={"Last-Event-ID": "1"})
+    try:
+        assert response.fp.readline() == b": connected\n"
+        assert response.fp.readline() == b"retry: 3000\n"
+        event = read_sse_event(response)
+        assert event["seq"] == 2
+        assert event["text"] == "two"
+    finally:
+        connection.close()
+
+
 def test_sse_recipient_filter(server):
     _, url, _ = create_channel(server)
     join(server, url, "alice")
@@ -458,8 +545,8 @@ def test_to_addressing_filters_readers(server):
     post(server, url, text="for bob only", to="bob")
 
     alice = read(server, url, as_name="alice")
-    assert [m["text"] for m in alice["messages"]] == ["joined", "joined"]
-    assert alice["cursor"] == 2
+    assert [m["text"] for m in alice["messages"]] == ["joined", "joined", "for bob only"]
+    assert alice["cursor"] == 3
 
     bob = read(server, url, since=2, as_name="bob")
     assert [m["text"] for m in bob["messages"]] == ["for bob only"]
@@ -467,18 +554,26 @@ def test_to_addressing_filters_readers(server):
     everyone = read(server, url, since=2)
     assert [m["text"] for m in everyone["messages"]] == ["for bob only"]
 
+    carol = read(server, url, since=2, as_name="carol")
+    assert carol["messages"] == []
+    assert carol["cursor"] == 2
+
 
 def test_join_registers_participant_and_announces(server):
     _, url, _ = create_channel(server)
     joined = join(server, url, "alice", "HIL rig")
     assert joined["participant"]["role"] == "HIL rig"
     assert joined["cursor"] == 1
+    assert "token" not in joined["channel"]
+    assert "url" not in joined["channel"]
 
     join(server, url, "bob", "firmware agent")
     status, payload, _ = api(server.base, "GET", path_of(url) + "/status")
     assert status == 200
     assert [p["name"] for p in payload["participants"]] == ["alice", "bob"]
     assert payload["participants"][1]["role"] == "firmware agent"
+    assert "token" not in payload["channel"]
+    assert "url" not in payload["channel"]
 
     page = read(server, url)
     assert [m["kind"] for m in page["messages"]] == ["join", "join"]
@@ -527,6 +622,16 @@ def test_json_sniffed_without_content_type(server):
     )
     assert status == 201
     assert payload["message"]["text"] == "sniffed"
+
+    status, payload, _ = api(
+        server.base,
+        "POST",
+        path_of(url) + "/messages",
+        data=json.dumps({"sender": "b", "text": "sniffed from text/plain"}),
+        headers={"Content-Type": "text/plain"},
+    )
+    assert status == 201
+    assert payload["message"]["text"] == "sniffed from text/plain"
 
 
 def test_reply_to_and_data_roundtrip(server):
@@ -589,6 +694,35 @@ def test_validation_errors(server):
     assert status == 413
 
 
+def test_oversized_body_returns_clean_413(server):
+    _, url, _ = create_channel(server)
+    body = b"x" * (1024 * 1024 + 1024)
+    status, payload, _ = api(
+        server.base,
+        "POST",
+        path_of(url) + "/messages",
+        data=body,
+        headers={"Content-Type": "text/plain"},
+        timeout=20,
+    )
+    assert status == 413
+    assert "request body is" in payload["error"]
+
+
+def test_json_error_includes_position(server):
+    _, url, _ = create_channel(server)
+    status, payload, _ = api(
+        server.base,
+        "POST",
+        path_of(url) + "/messages",
+        data='{"sender":"a","text":"unterminated',
+        headers={"Content-Type": "application/json"},
+    )
+    assert status == 400
+    assert "line 1" in payload["error"]
+    assert "column" in payload["error"]
+
+
 def test_unknown_routes_and_methods(server):
     status, payload, headers = api(server.base, "GET", "/nope")
     assert status == 404
@@ -598,6 +732,12 @@ def test_unknown_routes_and_methods(server):
     assert status == 405
     assert "POST /channels" in payload["error"]
     assert headers["Allow"] == "POST"
+
+    for method in ("PUT", "PATCH"):
+        status, payload, headers = api(server.base, method, "/")
+        assert status == 405
+        assert payload["error"] == "method not allowed"
+        assert headers["Allow"].startswith("GET")
 
     status, raw, headers = request(
         server.base, "OPTIONS", "/", headers={"Origin": "http://example.com"}
