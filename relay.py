@@ -939,6 +939,10 @@ class RelayHandler(BaseHTTPRequestHandler):
             except ValueError:
                 raise ApiError(400, "Last-Event-ID must be an integer")
         as_name = self._name_query(query, "as")
+        with self.relay.lock:
+            # A start past the head would otherwise leave the stream open and
+            # permanently silent, the same bug as a poisoned long-poll cursor.
+            since = min(since, channel.latest_seq())
         self._headers_sent = True
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")

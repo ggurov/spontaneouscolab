@@ -514,6 +514,21 @@ def test_sse_resumes_from_last_event_id(server):
         connection.close()
 
 
+def test_sse_cursor_past_head_still_delivers(server):
+    _, url, _ = create_channel(server)
+    post(server, url, text="before")
+
+    connection, response = sse(server, url, since=999999)
+    try:
+        assert response.status == 200
+        sent = post(server, url, sender="bob", text="after")
+        event = read_sse_event(response)
+        assert event["seq"] == sent["message"]["seq"]
+        assert event["text"] == "after"
+    finally:
+        connection.close()
+
+
 def test_sse_recipient_filter(server):
     _, url, _ = create_channel(server)
     join(server, url, "alice")
