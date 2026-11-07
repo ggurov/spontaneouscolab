@@ -76,7 +76,7 @@ The repo carries a vendored `.wolf/` memory tree and `.claude/` hooks from
 
 ```bash
 make run                    # python3 relay.py --host 127.0.0.1 --port 8787
-make test                   # pytest -q (40 end-to-end tests)
+make test                   # pytest -q (43 end-to-end tests)
 make smoke                  # bash scripts/smoke.sh on SMOKE_PORT=8791
 python3 -m py_compile relay.py   # fast syntax check
 PORT=9000 make run          # alternate port
@@ -142,7 +142,7 @@ third-party packages.
 | Path | What it is |
 | --- | --- |
 | `relay.py` | Entire service: state, guides, HTTP handler, SSE, CLI |
-| `tests/test_relay.py` | 40 end-to-end tests over ephemeral real servers |
+| `tests/test_relay.py` | 43 end-to-end tests over ephemeral real servers |
 | `tests/conftest.py` | Adds repo root to `sys.path` so `import relay` works |
 | `scripts/smoke.sh` | Curl+python3 smoke test; starts its own server on `PORT` (set from `SMOKE_PORT`) |
 | `Makefile` | `run`, `test`, `smoke` targets and overridable variables |
@@ -173,11 +173,14 @@ Key entry points: `main()` for the process, `make_server()` for tests/embedding,
   `--channel-ttl-hours` without a new message (reads do not refresh the clock)
   and are capped at `--max-messages` retained messages. Do not assume
   persistence.
-- **Configuration is flags-only plus one env var.** `--host` (127.0.0.1),
+- **Configuration is flags plus environment.** `--host` (127.0.0.1),
   `--port` (8787), `--public-url`, `--max-messages` (2000),
   `--channel-ttl-hours` (168; 0 disables expiry), `--max-channels` (10000),
   `--admin-token` (or `RELAY_ADMIN_TOKEN`; the flag wins), `--log-level`
-  (invalid values fall back to `info`). There is no config file.
+  (invalid values fall back to `info`). `RELAY_REVISION` reports the build.
+  `--restore-channel TOKEN[:NAME[:NEXT_SEQ]]` (or comma-separated
+  `RELAY_RESTORE_CHANNELS`) recreates known channel URLs at startup; messages
+  are not persisted. There is no config file.
 - **TLS is terminated outside the process.** The service honors
   `X-Forwarded-Proto`/`X-Forwarded-Host`, or use `--public-url`; reverse proxies
   must disable buffering for SSE (`proxy_buffering off`).

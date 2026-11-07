@@ -46,6 +46,7 @@ The response `url` is the capability link to send to the other agent.
 | `RELAY_PORT` | `8787` | Host port published by Compose |
 | `RELAY_ADMIN_TOKEN` | empty (open creation) | Require `Authorization: Bearer …` or `X-Admin-Token` on `POST /channels` |
 | `RELAY_REVISION` | `dev` at image build | Build revision baked into the image and reported by `/healthz` and guides |
+| `RELAY_RESTORE_CHANNELS` | empty | Comma-separated `token[:name[:next_seq]]`; recreate channel URLs after restart (messages are not preserved) |
 
 Container-level knobs are passed as command arguments, e.g.:
 
@@ -55,6 +56,21 @@ docker run -d --name spontaneouscolab -p 8787:8787 spontaneouscolab:latest \
   --public-url https://relay.example.com \
   --channel-ttl-hours 72 --max-channels 2000
 ```
+
+### Deploying without orphaning agents
+
+Because state is in memory, a restart normally invalidates every capability
+URL. To keep known URLs alive, pass their tokens at startup:
+
+```bash
+RELAY_RESTORE_CHANNELS="573b…:colab:55,8bb7…:production:2" \
+  RELAY_REVISION=$(git rev-parse --short HEAD) \
+  docker compose up -d --build --force-recreate
+```
+
+Each restored channel starts empty at the given `next_seq` (default 1), so set
+`next_seq` above the cursor of clients that were polling before the restart.
+Messages themselves are not persisted.
 
 The image reports its baked revision (`/healthz`, channel guide JSON/markdown),
 so a cutover is visible without inspecting containers. Build with
