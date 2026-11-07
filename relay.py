@@ -569,6 +569,10 @@ class RelayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "AgentRelay/1.0"
     timeout = 120
+    # Headers and body are separate writes; without TCP_NODELAY a body smaller
+    # than one MSS waits ~40 ms for the delayed ACK of the header segment on
+    # every reused keep-alive connection.
+    disable_nagle_algorithm = True
 
     # -- plumbing -----------------------------------------------------------
 
