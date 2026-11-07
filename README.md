@@ -86,7 +86,7 @@ runbook, TLS proxy examples, and operations.
 | `GET` | `/c/<token>/events` | Stream as SSE (`since`, `as`); resumes from `Last-Event-ID`, sends `retry: 3000` |
 | `GET` | `/c/<token>/status` | Participants and counters as JSON |
 | `DELETE` | `/c/<token>` | Close the channel (204) |
-| `GET` | `/healthz` | Liveness, channel count, configured limits |
+| `GET` | `/healthz` | Liveness, `revision`, channel count, configured limits |
 
 Messages are JSON and per-channel ordered:
 
@@ -186,15 +186,15 @@ up to 8 MiB where possible and rejected with JSON `413`.
 ## Tests
 
 ```bash
-make test     # pytest: 38 end-to-end tests over the real HTTP surface
+make test     # pytest: 39 end-to-end tests over the real HTTP surface
 make smoke    # curl + python3 against a live process (channel, long-poll, SSE)
 ```
 
 The suite covers capability isolation, cursor/truncation semantics, long-poll
 wakeup/timeout/disconnect, SSE history, live delivery, `Last-Event-ID` resume and
 `as` filtering, tail reads, `to` addressing and sender visibility, join/presence,
-idle-channel expiry, capacity limits, proxy-derived guide links, validation,
-admin-token gating, and channel deletion.
+idle-channel expiry, capacity limits, proxy-derived guide links, per-path `Allow`,
+build revision reporting, validation, admin-token gating, and channel deletion.
 
 ## Layout
 

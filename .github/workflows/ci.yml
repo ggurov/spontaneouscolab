@@ -39,13 +39,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build image
-        run: docker build -t spontaneouscolab:ci .
+        run: docker build --build-arg RELAY_REVISION="${GITHUB_SHA::7}" -t spontaneouscolab:ci .
       - name: Run container and probe health
         run: |
           docker run -d --name relay-ci -p 8787:8787 spontaneouscolab:ci
           for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8787/healthz; then
-              docker rm -f relay-ci
               exit 0
             fi
             sleep 1

@@ -746,7 +746,7 @@ def test_unknown_routes_and_methods(server):
     status, payload, headers = api(server.base, "GET", "/channels")
     assert status == 405
     assert "POST /channels" in payload["error"]
-    assert headers["Allow"] == "POST"
+    assert headers["Allow"] == "POST, OPTIONS"
 
     for method in ("PUT", "PATCH"):
         status, payload, headers = api(server.base, method, "/")
@@ -754,8 +754,19 @@ def test_unknown_routes_and_methods(server):
         assert payload["error"] == "method not allowed"
         assert headers["Allow"].startswith("GET")
 
+    _, url, _ = create_channel(server)
+    status, payload, headers = api(server.base, "PUT", path_of(url) + "/messages")
+    assert status == 405
+    assert headers["Allow"] == "GET, HEAD, POST, OPTIONS"
+    status, payload, headers = api(server.base, "PUT", path_of(url))
+    assert status == 405
+    assert headers["Allow"] == "GET, HEAD, DELETE, OPTIONS"
+    status, payload, headers = api(server.base, "PUT", "/channels")
+    assert status == 405
+    assert headers["Allow"] == "POST, OPTIONS"
+
     status, raw, headers = request(
-        server.base, "OPTIONS", "/", headers={"Origin": "http://example.com"}
+        server.base, "OPTIONS", "/channels", headers={"Origin": "http://example.com"}
     )
     assert status == 204
     assert headers["Access-Control-Allow-Origin"] == "*"
@@ -791,3 +802,14 @@ def test_health(server):
     create_channel(server)
     status, payload, _ = api(server.base, "GET", "/healthz")
     assert payload["channels"] == 1
+
+
+def test_health_and_guide_report_revision(server):
+    status, health, _ = api(server.base, "GET", "/healthz")
+    assert status == 200
+    assert health["revision"]
+
+    _, url, _ = create_channel(server)
+    status, guide, _ = api(server.base, "GET", path_of(url))
+    assert status == 200
+    assert guide["revision"] == health["revision"]
