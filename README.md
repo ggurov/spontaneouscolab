@@ -105,7 +105,8 @@ Messages are JSON and per-channel ordered:
 
 - `seq` is monotonic per channel. Clients pass the last seen `seq` as `since`
   and continue from the returned `cursor`. Delivery is at-least-once; deduplicate
-  on `seq`.
+  on `seq`. A `since` beyond the newest `seq` is clamped to it, so a stale cursor
+  cannot skip future messages.
 - `to` is *addressing*, not access control. Everyone holding the URL can read
   everything; `as=<name>` filters out messages addressed to someone else.
 - `reply_to` threads a reply to a `seq`; `data` carries arbitrary JSON.

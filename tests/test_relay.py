@@ -223,6 +223,15 @@ def test_channel_creation_invalid_json(server):
     assert status == 400
     assert "invalid JSON" in payload["error"]
 
+def test_invalid_json_error_reports_position(server):
+    _, url, _ = create_channel(server)
+    for path in ("/channels", path_of(url) + "/messages", path_of(url) + "/join"):
+        status, payload, _ = api(server.base, "POST", path, data="{not json",
+                                 headers={"Content-Type": "application/json"})
+        assert status == 400
+        assert "invalid JSON" in payload["error"]
+        assert "line 1" in payload["error"], payload
+
 
 def test_channel_name_must_be_single_line(server):
     status, payload, _ = api(server.base, "POST", "/channels", json_body={"name": "bad\nname"})
@@ -284,6 +293,20 @@ def test_cursor_semantics(server):
     page = read(server, url, since=3)
     assert page["messages"] == []
     assert page["cursor"] == 3
+
+
+def test_cursor_past_head_is_clamped(server):
+    _, url, _ = create_channel(server)
+    post(server, url, text="one")
+
+    page = read(server, url, since=999999)
+    assert page["messages"] == []
+    assert page["latest_seq"] == 1
+    assert page["cursor"] == 1
+
+    post(server, url, text="two")
+    page = read(server, url, since=page["cursor"])
+    assert [m["seq"] for m in page["messages"]] == [2]
 
 
 def test_limit_and_cursor_resume(server):

@@ -307,7 +307,8 @@ class Relay:
         oldest = channel.oldest_seq()
         return {
             "messages": messages,
-            "cursor": messages[-1]["seq"] if messages else since,
+            # Clamp to the head: a stale cursor must not skip future messages.
+            "cursor": messages[-1]["seq"] if messages else min(since, channel.latest_seq()),
             "latest_seq": channel.latest_seq(),
             "oldest_seq": oldest,
             "truncated": oldest is not None and since < oldest - 1,
@@ -442,9 +443,10 @@ curl -sS '%(url)s/messages?since=%(cursor)d&wait=60&as=my-agent'
 ```
 
 Response: `{"messages":[...],"cursor":N,"latest_seq":N,"oldest_seq":N,"truncated":false}`.
-Always continue from the returned `cursor`. `as` filters out messages addressed
-to a different participant with `to`. `truncated:true` means older messages were
-dropped from the ring buffer.
+Always continue from the returned `cursor`; a `since` beyond the newest message
+is clamped to the newest `seq`, so a stale cursor cannot skip future messages.
+`as` filters out messages addressed to a different participant with `to`.
+`truncated:true` means older messages were dropped from the ring buffer.
 
 Streaming alternative (server-sent events):
 
@@ -879,7 +881,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             try:
                 payload = json.loads(body)
             except json.JSONDecodeError as exc:
-                raise ApiError(400, "invalid JSON: %s" % exc.msg)
+                raise ApiError(400, "invalid JSON: %s" % exc)
             if not isinstance(payload, dict):
                 raise ApiError(400, "JSON body must be an object")
             name = self._clean_name(payload.get("name"), "name", required=False) or ""
@@ -920,7 +922,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             try:
                 parsed = json.loads(raw or b"{}")
             except json.JSONDecodeError as exc:
-                raise ApiError(400, "invalid JSON: %s" % exc.msg)
+                raise ApiError(400, "invalid JSON: %s" % exc)
             if not isinstance(parsed, dict):
                 raise ApiError(400, "JSON body must be an object")
             payload = parsed
@@ -993,7 +995,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(body)
         except json.JSONDecodeError as exc:
-            raise ApiError(400, "invalid JSON: %s" % exc.msg)
+            raise ApiError(400, "invalid JSON: %s" % exc)
         if not isinstance(payload, dict):
             raise ApiError(400, "JSON body must be an object")
         return payload
