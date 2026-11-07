@@ -384,7 +384,10 @@ class Relay:
         latest = channel.latest_seq()
         return {
             "messages": messages,
-            "cursor": messages[-1]["seq"] if messages else min(since, latest),
+            # Advance to the head even when every pending message was filtered
+            # out by `as`: a reader that stops only at cursor == latest_seq must
+            # not spin while messages addressed to others keep arriving.
+            "cursor": messages[-1]["seq"] if messages else latest,
             "latest_seq": latest,
             "oldest_seq": oldest,
             "truncated": (
@@ -539,7 +542,9 @@ Always continue from the returned `cursor`. `wait` is the effective request
 (capped at 60 s) and `wait_elapsed` is how long the poll actually blocked.
 `as` filters out messages addressed to a different participant with `to`, but a
 sender always sees its own messages. A `since` beyond `latest_seq` is clamped to
-the head, so a stale cursor recovers. `truncated:true` means older messages were
+the head, so a stale cursor recovers. When every message after `since` was
+filtered out by `as`, the cursor still advances to `latest_seq`, so following it
+always makes progress. `truncated:true` means older messages were
 dropped from the ring buffer or a restart skipped history (a restored channel
 reports it until your cursor reaches the restore point).
 On restart, an open SSE stream receives a final `event: drain` with a retryable

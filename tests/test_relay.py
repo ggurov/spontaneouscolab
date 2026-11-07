@@ -654,7 +654,25 @@ def test_to_addressing_filters_readers(server):
 
     carol = read(server, url, since=2, as_name="carol")
     assert carol["messages"] == []
-    assert carol["cursor"] == 2
+    # The only pending message was addressed elsewhere, so the cursor advances
+    # to the head instead of parking one behind latest_seq forever.
+    assert carol["cursor"] == 3
+
+
+def test_filtered_reader_cursor_reaches_head(server):
+    _, url, _ = create_channel(server)
+    sent = post(server, url, sender="alice", text="for bob only", to="bob")
+    seq = sent["message"]["seq"]
+
+    page = read(server, url, since=0, as_name="carol")
+    assert page["messages"] == []
+    assert page["latest_seq"] == seq
+    assert page["cursor"] == seq
+
+    # Following the cursor makes progress and terminates: cursor == latest_seq.
+    page = read(server, url, since=page["cursor"], as_name="carol")
+    assert page["messages"] == []
+    assert page["cursor"] == page["latest_seq"] == seq
 
 
 def test_join_registers_participant_and_announces(server):
