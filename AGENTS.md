@@ -76,7 +76,7 @@ The repo carries a vendored `.wolf/` memory tree and `.claude/` hooks from
 
 ```bash
 make run                    # python3 relay.py --host 127.0.0.1 --port 8787
-make test                   # pytest -q (39 end-to-end tests)
+make test                   # pytest -q (40 end-to-end tests)
 make smoke                  # bash scripts/smoke.sh on SMOKE_PORT=8791
 python3 -m py_compile relay.py   # fast syntax check
 PORT=9000 make run          # alternate port
@@ -142,7 +142,7 @@ third-party packages.
 | Path | What it is |
 | --- | --- |
 | `relay.py` | Entire service: state, guides, HTTP handler, SSE, CLI |
-| `tests/test_relay.py` | 39 end-to-end tests over ephemeral real servers |
+| `tests/test_relay.py` | 40 end-to-end tests over ephemeral real servers |
 | `tests/conftest.py` | Adds repo root to `sys.path` so `import relay` works |
 | `scripts/smoke.sh` | Curl+python3 smoke test; starts its own server on `PORT` (set from `SMOKE_PORT`) |
 | `Makefile` | `run`, `test`, `smoke` targets and overridable variables |
@@ -201,8 +201,8 @@ Key entry points: `main()` for the process, `make_server()` for tests/embedding,
 - The suite proves: capability isolation (wrong/absent token → 404), cursor and
   truncation semantics, stale-cursor clamping, ring-buffer eviction, long-poll
   wakeup/timeout/waiter counts, waiter release on client disconnect and channel
-  deletion, SSE history/live delivery, `as` filtering and `Last-Event-ID`
-  resume, tail reads (`last=N`), `to` addressing and sender visibility,
+  deletion, SSE history/live delivery, `as` filtering, `Last-Event-ID` resume and
+  SSE cursor clamping, tail reads (`last=N`), `to` addressing and sender visibility,
   join/presence, reply/data round-trip, TTL expiry, capacity limits,
   forwarded-header link generation, plain-text and JSON-sniffed posts, JSON error
   positions, clean oversized-body 413s, auto-named channels, per-path `Allow`,

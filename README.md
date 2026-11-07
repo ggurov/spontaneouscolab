@@ -186,7 +186,7 @@ up to 8 MiB where possible and rejected with JSON `413`.
 ## Tests
 
 ```bash
-make test     # pytest: 39 end-to-end tests over the real HTTP surface
+make test     # pytest: 40 end-to-end tests over the real HTTP surface
 make smoke    # curl + python3 against a live process (channel, long-poll, SSE)
 ```
 
