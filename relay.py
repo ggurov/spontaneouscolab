@@ -542,6 +542,8 @@ sender always sees its own messages. A `since` beyond `latest_seq` is clamped to
 the head, so a stale cursor recovers. `truncated:true` means older messages were
 dropped from the ring buffer or a restart skipped history (a restored channel
 reports it until your cursor reaches the restore point).
+On restart, an open SSE stream receives a final `event: drain` with a retryable
+error and then ends; treat EOF as "reconnect from the last id".
 
 Read the newest retained messages in one call (no long-poll), e.g. when joining:
 
@@ -1045,9 +1047,11 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
             last_write = time.monotonic()
             while True:
+                if self.relay.stopping:
+                    self.wfile.write(b'event: drain\ndata: {"error": "server restarting; retry"}\n\n')
+                    self.wfile.flush()
+                    break
                 with self.relay.lock:
-                    if self.relay.stopping:
-                        break
                     messages = channel.snapshot(since, as_name, MAX_LIMIT)
                     if not messages and not channel.closed:
                         channel.cond.wait(SSE_HEARTBEAT)
