@@ -684,7 +684,13 @@ class RelayHandler(BaseHTTPRequestHandler):
     def handle_one_request(self) -> None:
         self._headers_sent = False
         self._body_read = False
-        super().handle_one_request()
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError):
+            # The keep-alive loop reads again after a completed response; a
+            # peer that RSTs (closed tab, short-lived client) hits that read
+            # with ECONNRESET, which is a disconnect, not a server error.
+            self.close_connection = True
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         parts, _query = self._route()

@@ -3,6 +3,7 @@
 import http.client
 import json
 import socket
+import struct
 import threading
 import time
 import urllib.error
@@ -814,3 +815,25 @@ def test_health_and_guide_report_revision(server):
     status, guide, _ = api(server.base, "GET", path_of(url))
     assert status == 200
     assert guide["revision"] == health["revision"]
+
+
+def test_rst_after_completed_response_logs_no_traceback(server, capfd):
+    _, url, _ = create_channel(server)
+
+    connection = http.client.HTTPConnection(server.host, server.port, timeout=5)
+    connection.request("GET", path_of(url))
+    response = connection.getresponse()
+    response.read()
+    # SO_LINGER(1, 0) turns close() into an RST, like a tab closed mid-stream.
+    connection.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    connection.close()
+
+    captured = ""
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline:
+        captured += capfd.readouterr().err
+        if "Exception occurred during processing of request" in captured:
+            break
+        time.sleep(0.05)
+
+    assert "Exception occurred during processing of request" not in captured
