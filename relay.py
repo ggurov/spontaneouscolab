@@ -1252,9 +1252,10 @@ class RelayHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     # stdlib defaults the listen backlog to 5. A post wakes every parked
-    # waiter at once, so 20 waiters reconnecting in a burst overflow it and
-    # the kernel drops SYNs: clients retry after 1 s, then 2 s.
-    request_queue_size = 128
+    # waiter at once; large fan-out bursts then overflow the accept queue and
+    # the kernel drops SYNs (1s/2s retransmits). 512 covers burst tests up to
+    # that size; somaxconn is typically 4096.
+    request_queue_size = 512
 
     def __init__(self, address, handler, relay: Relay):
         self.relay = relay

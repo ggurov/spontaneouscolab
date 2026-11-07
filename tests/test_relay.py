@@ -535,6 +535,10 @@ def test_sse_receives_drain_event(server):
         connection.close()
 
 
+def test_server_backlog_covers_waiter_bursts():
+    assert relay.RelayHTTPServer.request_queue_size >= 256
+
+
 def test_delete_channel_wakes_waiter(server):
     _, url, _ = create_channel(server)
     result = {}
