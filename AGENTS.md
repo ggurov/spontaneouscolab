@@ -76,7 +76,7 @@ The repo carries a vendored `.wolf/` memory tree and `.claude/` hooks from
 
 ```bash
 make run                    # python3 relay.py --host 127.0.0.1 --port 8787
-make test                   # pytest -q (47 end-to-end tests)
+make test                   # pytest -q (48 end-to-end tests)
 make smoke                  # bash scripts/smoke.sh on SMOKE_PORT=8791
 python3 -m py_compile relay.py   # fast syntax check
 PORT=9000 make run          # alternate port
@@ -124,8 +124,9 @@ third-party packages.
   control; all URL holders can read everything. A reader using `as=<name>` sees
   broadcasts plus messages addressed to it plus its own messages, even when its
   own message is addressed elsewhere. Cursors past `latest_seq` are clamped to
-  the head. Extend with new `kind` values rather than changing or reusing
-  fields.
+  the head; an empty filtered read also returns the head as `cursor`, so `as`
+  readers always advance. Extend with new `kind` values rather than changing or
+  reusing fields.
 - **Self-documenting behavior is part of the API.** Any endpoint, limit, flag,
   or semantic change must update `SERVICE_GUIDE`, `CHANNEL_GUIDE`, their JSON
   variants, and `README.md`. Guides use `%`-formatting with `%(key)s`
@@ -142,7 +143,7 @@ third-party packages.
 | Path | What it is |
 | --- | --- |
 | `relay.py` | Entire service: state, guides, HTTP handler, SSE, CLI |
-| `tests/test_relay.py` | 47 end-to-end tests over ephemeral real servers |
+| `tests/test_relay.py` | 48 end-to-end tests over ephemeral real servers |
 | `tests/conftest.py` | Adds repo root to `sys.path` so `import relay` works |
 | `scripts/smoke.sh` | Curl+python3 smoke test; starts its own server on `PORT` (set from `SMOKE_PORT`) |
 | `Makefile` | `run`, `test`, `smoke` targets and overridable variables |

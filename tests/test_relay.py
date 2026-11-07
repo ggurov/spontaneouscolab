@@ -654,7 +654,17 @@ def test_to_addressing_filters_readers(server):
 
     carol = read(server, url, since=2, as_name="carol")
     assert carol["messages"] == []
-    assert carol["cursor"] == 2
+    assert carol["cursor"] == 3
+
+
+def test_filtered_empty_read_advances_to_head(server):
+    _, url, _ = create_channel(server)
+    post(server, url, text="for alice", to="alice")
+
+    page = read(server, url, since=0, as_name="bob")
+    assert page["messages"] == []
+    assert page["cursor"] == 1
+    assert page["latest_seq"] == 1
 
 
 def test_join_registers_participant_and_announces(server):
