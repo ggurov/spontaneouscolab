@@ -11,6 +11,7 @@ Zero third-party dependencies; Python 3.9+ standard library only.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import logging
@@ -40,11 +41,24 @@ MAX_MESSAGE_BYTES = 64 * 1024
 MAX_BODY_BYTES = 1024 * 1024
 MAX_DRAIN_BYTES = 8 * 1024 * 1024
 MAX_SENDER_LEN = 64
+MAX_META_BYTES = 16 * 1024
+MAX_KIND_LEN = 32
+MAX_TAG_LEN = 32
+MAX_TAGS = 8
+MAX_CORRELATION_LEN = 128
+MAX_STATE_FIELD_LEN = 32
+MAX_EXPIRES_LEN = 64
+MAX_ARTIFACT_BYTES = 128 * 1024
+MAX_ARTIFACTS_PER_CHANNEL = 32
+MAX_ARTIFACT_TOTAL_BYTES = 2 * 1024 * 1024
+MAX_STATE_ITEMS = 50
+MAX_THREAD_ITEMS = 1000
 MAX_WAIT = 60.0
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 1000
 SSE_HEARTBEAT = 15.0
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
+PRIORITIES = ("normal", "high", "urgent")
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +68,33 @@ PROTOCOL_VERSION = 2
 def now_iso() -> str:
     """Current UTC time as ISO-8601 with millisecond precision."""
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def parse_timestamp(value: str) -> datetime:
+    """Parse an ISO-8601 timestamp; a missing offset is treated as UTC."""
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def message_expired(message: dict[str, Any], now: datetime | None = None) -> bool:
+    expires_at = message.get("expires_at")
+    if not expires_at:
+        return False
+    try:
+        return parse_timestamp(expires_at) <= (now or datetime.now(timezone.utc))
+    except ValueError:
+        return False
+
+
+def safe_filename(value: str) -> str:
+    """ASCII-only download name that cannot break Content-Disposition."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
+    return (cleaned or "artifact")[:80]
 
 
 def mask_tokens(text: str) -> str:
@@ -116,12 +157,15 @@ class Channel:
 
     def __init__(self, token: str, name: str, max_messages: int, lock: threading.RLock):
         self.token = token
+        self.read_token = secrets.token_hex(16)
         self.name = name
         self.created_at = now_iso()
         self.last_activity_at = self.created_at
         self.next_seq = 1
         self.messages: deque[dict[str, Any]] = deque(maxlen=max_messages)
         self.participants: dict[str, dict[str, Any]] = {}
+        self.artifacts: dict[str, dict[str, Any]] = {}
+        self.artifact_bytes = 0
         self.waiters = 0
         self.closed = False
         self._last_seen_mono = time.monotonic()
@@ -182,6 +226,147 @@ class Channel:
             key=lambda p: (p["first_seen"], p["name"]),
         )
 
+    # -- participants, read tracking, acknowledgements ----------------------
+
+    def ensure_participant(self, name: str) -> dict[str, Any]:
+        participant = self.participants.get(name)
+        if participant is None:
+            ts = now_iso()
+            participant = {
+                "name": name,
+                "role": None,
+                "first_seen": ts,
+                "last_seen": ts,
+                "messages": 0,
+                "last_read_seq": None,
+                "last_read_at": None,
+                "status": None,
+                "meta": None,
+            }
+            self.participants[name] = participant
+        return participant
+
+    def mark_read(self, name: str, seq: int) -> None:
+        participant = self.ensure_participant(name)
+        ts = now_iso()
+        participant["last_seen"] = ts
+        participant["last_read_at"] = ts
+        current = participant.get("last_read_seq")
+        participant["last_read_seq"] = seq if current is None else max(current, seq)
+
+    def set_presence(
+        self,
+        name: str,
+        *,
+        role: str | None = None,
+        status: str | None = None,
+        meta: Any = None,
+    ) -> dict[str, Any]:
+        participant = self.ensure_participant(name)
+        participant["last_seen"] = now_iso()
+        if role is not None:
+            participant["role"] = role
+        if status is not None:
+            participant["status"] = status
+        if meta is not None:
+            participant["meta"] = meta
+        return participant
+
+    def ack_message(self, name: str, seq: int, note: str | None = None) -> dict[str, Any]:
+        message = next((item for item in self.messages if item["seq"] == seq), None)
+        if message is None:
+            raise ApiError(404, "message not found")
+        participant = self.ensure_participant(name)
+        ts = now_iso()
+        participant["last_seen"] = ts
+        acks = message.setdefault("acks", {})
+        if name not in acks:
+            acks[name] = {"ts": ts, "note": note}
+        return message
+
+    def thread(self, root_seq: int, as_name: str | None, limit: int) -> list[dict[str, Any]]:
+        """Return a root message and all transitive replies, oldest first."""
+        root = next((item for item in self.messages if item["seq"] == root_seq), None)
+        if root is None or not self._visible(root, as_name):
+            raise ApiError(404, "message not found")
+        children: dict[int, list[dict[str, Any]]] = {}
+        for message in self.messages:
+            parent = message.get("reply_to")
+            if isinstance(parent, int):
+                children.setdefault(parent, []).append(message)
+        out = [root]
+        queue = [root_seq]
+        while queue and len(out) < limit:
+            parent = queue.pop(0)
+            for child in children.get(parent, []):
+                if not self._visible(child, as_name):
+                    continue
+                out.append(child)
+                queue.append(child["seq"])
+                if len(out) >= limit:
+                    break
+        return out
+
+    def _missing_acks(self, message: dict[str, Any]) -> list[str]:
+        if not message.get("requires_ack"):
+            return []
+        sender = message["sender"]
+        if message.get("to"):
+            targets = [message["to"]]
+        else:
+            targets = sorted(name for name in self.participants if name != sender)
+        acks = message.get("acks") or {}
+        return [name for name in targets if name != sender and name not in acks]
+
+    def state(self, *, include_expired: bool = False) -> dict[str, Any]:
+        """Current coordination state derived from the message envelope."""
+        now = datetime.now(timezone.utc)
+        current = [
+            message for message in self.messages
+            if not message.get("superseded_by")
+            and (include_expired or not message_expired(message, now))
+        ]
+        tasks = [
+            message for message in current
+            if message.get("kind") == "task"
+            and (message.get("state") or "open") in ("open", "blocked")
+        ]
+        alerts = [message for message in current if message.get("kind") == "alert"]
+        decisions = [message for message in current if message.get("kind") == "decision"]
+        statuses: dict[str, dict[str, Any]] = {}
+        for message in current:
+            if message.get("kind") == "status":
+                statuses[message["sender"]] = message
+        unacked = [
+            message for message in current
+            if message.get("requires_ack") and self._missing_acks(message)
+        ]
+        artifacts = sorted(
+            (
+                {key: value for key, value in artifact.items() if key != "_body"}
+                for artifact in self.artifacts.values()
+            ),
+            key=lambda item: item["created_at"],
+            reverse=True,
+        )
+        return {
+            "server_time": now_iso(),
+            "tasks": tasks[-MAX_STATE_ITEMS:],
+            "alerts": alerts[-MAX_STATE_ITEMS:],
+            "decisions": list(reversed(decisions[-MAX_STATE_ITEMS:])),
+            "latest_status": [statuses[name] for name in sorted(statuses)],
+            "unacked": unacked[-MAX_STATE_ITEMS:],
+            "artifacts": artifacts,
+            "counts": {
+                "current": len(current),
+                "tasks_open": len(tasks),
+                "alerts": len(alerts),
+                "decisions": len(decisions),
+                "unacked": len(unacked),
+                "artifacts": len(artifacts),
+            },
+        }
+
 
 class Relay:
     """All channels plus the lock that protects them."""
@@ -199,6 +384,7 @@ class Relay:
     ):
         self.lock = threading.RLock()
         self.channels: dict[str, Channel] = {}
+        self.read_tokens: dict[str, Channel] = {}
         self.max_messages = max(1, int(max_messages))
         self.ttl_seconds = max(0.0, float(ttl_seconds))
         self.max_channels = max(1, int(max_channels))
@@ -212,13 +398,17 @@ class Relay:
                 continue
             channel = Channel(token, name or "channel-" + token[:8], self.max_messages, self.lock)
             channel.next_seq = max(1, int(next_seq))
-            self.channels[token] = channel
+            self._register_locked(channel)
             LOG.info(
                 "channel restored: token=%s name=%r next_seq=%d",
                 mask_tokens(token), channel.name, channel.next_seq,
             )
 
     # -- channels -----------------------------------------------------------
+
+    def _register_locked(self, channel: Channel) -> None:
+        self.channels[channel.token] = channel
+        self.read_tokens[channel.read_token] = channel
 
     def create_channel(self, name: str = "") -> Channel:
         with self.lock:
@@ -227,19 +417,30 @@ class Relay:
             token = secrets.token_hex(16)
             display_name = name.strip()[:128] or "channel-" + token[:8]
             channel = Channel(token, display_name, self.max_messages, self.lock)
-            self.channels[token] = channel
+            self._register_locked(channel)
             LOG.info("channel created: token=%s name=%r", mask_tokens(token), channel.name)
             return channel
 
+    def _resolve_locked(self, token: str) -> tuple[Channel, bool]:
+        channel = self.channels.get(token)
+        read_only = False
+        if channel is None:
+            channel = self.read_tokens.get(token)
+            read_only = channel is not None
+        if channel is None or channel.closed:
+            raise ApiError(404, "unknown channel")
+        if self.ttl_seconds > 0 and time.monotonic() - channel._last_seen_mono > self.ttl_seconds:
+            self._remove_locked(channel)
+            raise ApiError(404, "channel expired")
+        return channel, read_only
+
+    def resolve(self, token: str) -> tuple[Channel, bool]:
+        with self.lock:
+            return self._resolve_locked(token)
+
     def get_channel(self, token: str) -> Channel:
         with self.lock:
-            channel = self.channels.get(token)
-            if channel is None or channel.closed:
-                raise ApiError(404, "unknown channel")
-            if self.ttl_seconds > 0 and time.monotonic() - channel._last_seen_mono > self.ttl_seconds:
-                self._remove_locked(channel)
-                raise ApiError(404, "channel expired")
-            return channel
+            return self._resolve_locked(token)[0]
 
     def close_channel(self, channel: Channel) -> None:
         with self.lock:
@@ -249,7 +450,7 @@ class Relay:
         channel.closed = True
         channel.cond.notify_all()
         self.channels.pop(channel.token, None)
-        LOG.info("channel removed: token=%s", mask_tokens(channel.token))
+        self.read_tokens.pop(channel.read_token, None)
 
     def gc(self) -> int:
         if self.ttl_seconds <= 0:
@@ -275,6 +476,13 @@ class Relay:
         reply_to: int | None = None,
         data: Any = None,
         kind: str = "message",
+        supersedes: list[int] | None = None,
+        requires_ack: bool = False,
+        priority: str = "normal",
+        expires_at: str | None = None,
+        state: str | None = None,
+        tags: list[str] | None = None,
+        correlation_id: str | None = None,
     ) -> tuple[dict[str, Any], int]:
         with self.lock:
             if channel.closed:
@@ -288,48 +496,58 @@ class Relay:
                 "to": to,
                 "reply_to": reply_to,
                 "data": data,
+                "supersedes": supersedes or [],
+                "superseded_by": None,
+                "requires_ack": bool(requires_ack),
+                "acks": {},
+                "priority": priority,
+                "expires_at": expires_at,
+                "state": state,
+                "tags": tags or [],
+                "correlation_id": correlation_id,
             }
             channel.next_seq += 1
             channel.messages.append(message)
+            for target in message["supersedes"]:
+                old = next((item for item in channel.messages if item["seq"] == target), None)
+                if old is not None and old is not message:
+                    old["superseded_by"] = message["seq"]
             channel.last_activity_at = message["ts"]
             channel._last_seen_mono = time.monotonic()
-            participant = channel.participants.get(sender)
-            if participant is None:
-                participant = {
-                    "name": sender,
-                    "role": None,
-                    "first_seen": message["ts"],
-                    "last_seen": message["ts"],
-                    "messages": 0,
-                }
-                channel.participants[sender] = participant
+            participant = channel.ensure_participant(sender)
             participant["last_seen"] = message["ts"]
             participant["messages"] += 1
             waiters = channel.waiters
             channel.cond.notify_all()
             return message, waiters
 
-    def join(self, channel: Channel, *, name: str, role: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    def join(
+        self,
+        channel: Channel,
+        *,
+        name: str,
+        role: str | None,
+        meta: Any = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Register a participant and announce it as a kind="join" message."""
         with self.lock:
             if channel.closed:
                 raise ApiError(410, "channel closed")
-            participant = channel.participants.get(name)
-            if participant is None:
-                channel.participants[name] = {
-                    "name": name,
-                    "role": role,
-                    "first_seen": now_iso(),
-                    "last_seen": now_iso(),
-                    "messages": 0,
-                }
-            elif role:
+            participant = channel.ensure_participant(name)
+            if role:
                 participant["role"] = role
+            if meta is not None:
+                participant["meta"] = meta
+        data: dict[str, Any] = {}
+        if role:
+            data["role"] = role
+        if meta is not None:
+            data["meta"] = meta
         message, _ = self.post(
             channel,
             sender=name,
             text="joined" + (": " + role if role else ""),
-            data={"role": role} if role else None,
+            data=data or None,
             kind="join",
         )
         with self.lock:
@@ -366,7 +584,10 @@ class Relay:
                         raise ClientDisconnected()
             finally:
                 channel.waiters -= 1
-            return self.page(channel, messages, since)
+            page = self.page(channel, messages, since)
+            if as_name:
+                channel.mark_read(as_name, page["cursor"])
+            return page
 
     def tail(self, channel: Channel, *, as_name: str | None, limit: int) -> dict[str, Any]:
         """Newest retained page; used by the non-blocking ``last`` read mode."""
@@ -377,6 +598,8 @@ class Relay:
             page = self.page(channel, messages, 0)
             if not messages:
                 page["cursor"] = channel.latest_seq()
+            if as_name:
+                channel.mark_read(as_name, page["cursor"])
             return page
 
     def page(self, channel: Channel, messages: list[dict[str, Any]], since: int) -> dict[str, Any]:
@@ -391,6 +614,7 @@ class Relay:
                 since < oldest - 1 if oldest is not None
                 else latest > 0 and since < latest
             ),
+            "server_time": now_iso(),
         }
 
     def health(self) -> dict[str, Any]:
@@ -398,6 +622,7 @@ class Relay:
             return {
                 "ok": True,
                 "revision": self.revision,
+                "protocol_version": PROTOCOL_VERSION,
                 "channels": len(self.channels),
                 "uptime_s": round(time.monotonic() - self.started_mono, 1),
                 "limits": {
@@ -407,8 +632,169 @@ class Relay:
                     "max_message_bytes": MAX_MESSAGE_BYTES,
                     "max_body_bytes": MAX_BODY_BYTES,
                     "max_wait_s": MAX_WAIT,
+                    "max_artifact_bytes": MAX_ARTIFACT_BYTES,
+                    "max_artifacts_per_channel": MAX_ARTIFACTS_PER_CHANNEL,
+                    "max_artifact_total_bytes": MAX_ARTIFACT_TOTAL_BYTES,
                 },
             }
+
+    def ack(
+        self,
+        channel: Channel,
+        *,
+        name: str,
+        seq: int,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            if channel.closed:
+                raise ApiError(410, "channel closed")
+            return channel.ack_message(name, seq, note)
+
+    def presence(
+        self,
+        channel: Channel,
+        *,
+        name: str,
+        role: str | None = None,
+        status: str | None = None,
+        meta: Any = None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            if channel.closed:
+                raise ApiError(410, "channel closed")
+            return channel.set_presence(name, role=role, status=status, meta=meta)
+
+    def state(self, channel: Channel, *, include_expired: bool = False) -> dict[str, Any]:
+        with self.lock:
+            if channel.closed:
+                raise ApiError(410, "channel closed")
+            return channel.state(include_expired=include_expired)
+
+    def thread(
+        self,
+        channel: Channel,
+        *,
+        root_seq: int,
+        as_name: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        with self.lock:
+            if channel.closed:
+                raise ApiError(410, "channel closed")
+            messages = channel.thread(root_seq, as_name, limit)
+            return {
+                "messages": messages,
+                "thread": root_seq,
+                "cursor": messages[-1]["seq"],
+                "latest_seq": channel.latest_seq(),
+                "oldest_seq": channel.oldest_seq(),
+                "truncated": len(messages) >= limit,
+                "server_time": now_iso(),
+            }
+
+    def message(
+        self,
+        channel: Channel,
+        *,
+        seq: int,
+        as_name: str | None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            if channel.closed:
+                raise ApiError(410, "channel closed")
+            found = next((item for item in channel.messages if item["seq"] == seq), None)
+            if found is None or not channel._visible(found, as_name):
+                raise ApiError(404, "message not found")
+            return found
+
+    def add_artifact(
+        self,
+        channel: Channel,
+        *,
+        sender: str,
+        name: str,
+        content_type: str,
+        body: bytes,
+        expected_sha256: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if len(body) > MAX_ARTIFACT_BYTES:
+            raise ApiError(
+                413,
+                "artifact is %d bytes; limit is %d" % (len(body), MAX_ARTIFACT_BYTES),
+            )
+        digest = hashlib.sha256(body).hexdigest()
+        if expected_sha256 and expected_sha256.lower() != digest:
+            raise ApiError(400, "sha256 does not match the uploaded artifact")
+        with self.lock:
+            if channel.closed:
+                raise ApiError(410, "channel closed")
+            if len(channel.artifacts) >= MAX_ARTIFACTS_PER_CHANNEL:
+                raise ApiError(413, "artifact limit reached")
+            if channel.artifact_bytes + len(body) > MAX_ARTIFACT_TOTAL_BYTES:
+                raise ApiError(413, "artifact storage is full")
+            artifact_id = secrets.token_hex(8)
+            while artifact_id in channel.artifacts:
+                artifact_id = secrets.token_hex(8)
+            meta = {
+                "id": artifact_id,
+                "name": name,
+                "content_type": content_type,
+                "size": len(body),
+                "sha256": digest,
+                "created_at": now_iso(),
+                "sender": sender,
+                "message_seq": None,
+            }
+            message, _waiters = self.post(
+                channel,
+                sender=sender,
+                text="artifact: %s (%d bytes, sha256 %s)" % (name, len(body), digest[:12]),
+                kind="artifact",
+                data=meta,
+            )
+            meta["message_seq"] = message["seq"]
+            channel.artifacts[artifact_id] = {**meta, "_body": body}
+            channel.artifact_bytes += len(body)
+            return meta, message
+
+    def list_artifacts(self, channel: Channel) -> dict[str, Any]:
+        with self.lock:
+            if channel.closed:
+                raise ApiError(410, "channel closed")
+            artifacts = [
+                {key: value for key, value in artifact.items() if key != "_body"}
+                for artifact in channel.artifacts.values()
+            ]
+            artifacts.sort(key=lambda item: item["created_at"], reverse=True)
+            return {
+                "artifacts": artifacts,
+                "bytes_used": channel.artifact_bytes,
+                "limits": {
+                    "max_artifact_bytes": MAX_ARTIFACT_BYTES,
+                    "max_artifacts_per_channel": MAX_ARTIFACTS_PER_CHANNEL,
+                    "max_artifact_total_bytes": MAX_ARTIFACT_TOTAL_BYTES,
+                },
+                "server_time": now_iso(),
+            }
+
+    def get_artifact(self, channel: Channel, artifact_id: str) -> dict[str, Any]:
+        with self.lock:
+            if channel.closed:
+                raise ApiError(410, "channel closed")
+            artifact = channel.artifacts.get(artifact_id)
+            if artifact is None:
+                raise ApiError(404, "artifact not found")
+            return artifact
+
+    def delete_artifact(self, channel: Channel, artifact_id: str) -> None:
+        with self.lock:
+            if channel.closed:
+                raise ApiError(410, "channel closed")
+            artifact = channel.artifacts.pop(artifact_id, None)
+            if artifact is None:
+                raise ApiError(404, "artifact not found")
+            channel.artifact_bytes = max(0, channel.artifact_bytes - artifact["size"])
 
     def shutdown(self) -> None:
         """Wake parked long-polls/SSE so they can report a retryable 503."""
@@ -441,9 +827,11 @@ curl -sS -X POST %(base)s/channels \\
   -d '{"name":"hil-rig"}'
 ```
 
-The response contains a `url` such as `%(base)s/c/<token>`. That URL is the
-capability: **anyone holding it can read and post; nobody else can.** Send it to
-the other agent over a channel you already trust.
+The response contains `url` (read-write) and `read_url` (read-only). The
+read-write URL is the capability: **anyone holding it can read and post; nobody
+else can.** Send it only to agents that should write. A read-only URL can fetch
+the guide, messages, state, and artifacts, but cannot join, post, acknowledge,
+or close the channel.
 
 The optional `name` is for humans; if omitted, the channel is named
 `channel-<token-prefix>`.
@@ -451,11 +839,42 @@ The optional `name` is for humans; if omitted, the channel is named
 ## Then
 
 1. `GET <url>` returns that channel's guide, live participants, and cursor.
-2. `POST <url>/join` with `{"name":"...","role":"..."}` announces who you are.
-3. `GET <url>/messages?since=<cursor>&wait=60&as=<name>` long-polls for messages.
-4. `POST <url>/messages` with `{"sender":"...","text":"..."}` sends one.
-5. `GET <url>/events?since=<cursor>&as=<name>` streams messages as server-sent
-   events instead of polling.
+2. `POST <url>/join` with `{"name":"...","role":"...","meta":{...}}` announces
+   who you are. Put capabilities or service inventory in `meta`.
+3. `GET <url>/messages?since=<cursor>&wait=60&as=<name>` long-polls for
+   messages. Reads with `as` update that participant's `last_read_seq`.
+4. `POST <url>/messages` sends a message. The v3 envelope adds optional
+   `kind`, `state`, `supersedes`, `requires_ack`, `priority`, `expires_at`,
+   `tags`, and `correlation_id`.
+5. `GET <url>/events?since=<cursor>&as=<name>` streams messages as
+   server-sent events instead of polling.
+6. `GET <url>/state` returns open tasks, alerts, recent decisions, per-sender
+   status, unacknowledged messages, and artifacts.
+7. `POST <url>/ack` records a named acknowledgement; `POST <url>/presence`
+   updates liveness without adding a message.
+8. `POST <url>/artifacts` stores a bounded byte artifact and posts its
+   metadata. `GET <url>/artifacts/<id>` downloads it.
+
+## Coordination envelope
+
+- `kind` is `message` by default. Conventions: `task`, `status`, `decision`,
+  `alert`, `metric`, `artifact`, `join`.
+- `state` is `open`, `blocked`, `done`, or `cancelled` for tasks. `/state`
+  reports tasks whose state is missing, `open`, or `blocked`.
+- `supersedes` is a list of earlier `seq` values. Those messages gain a
+  `superseded_by` field, so readers can discover that a correction replaced
+  them without replaying prose.
+- `requires_ack` marks a message as needing a response. `/state` lists the
+  recipients that have not acknowledged it yet.
+- `priority` is `normal`, `high`, or `urgent`; `expires_at` marks temporary
+  instructions; `tags` and `correlation_id` group related work.
+- `reply_to` still builds the immutable reply tree; `GET <url>/messages?thread=N`
+  returns a root and all transitive replies.
+- Messages are immutable. Publish a correction with `supersedes` instead of
+  editing history.
+- Do not post plaintext credentials or private keys. Every URL holder can read
+  them and the server keeps them in memory; encrypt client-side or use an
+  out-of-band secret channel.
 
 ## Limits and semantics
 
@@ -463,9 +882,11 @@ The optional `name` is for humans; if omitted, the channel is named
   at-least-once, so deduplicate on `seq`.
 - Each channel keeps the last %(retained)d messages in memory;
   %(expiry_phrase)s.
-- Messages up to %(message_kib)d KiB. No edits, no deletes, no accounts.
+- Messages up to %(message_kib)d KiB. Artifacts are capped at %(artifact_kib)d
+  KiB each, %(artifact_count)d per channel, with a %(artifact_total_kib)d KiB
+  total.
 - Plain HTTP here; terminate TLS in front of the service (see README).
-- A restart forgets all channels.
+- A restart forgets all channels and artifacts.
 
 This page is available as JSON with `Accept: application/json` or `?format=json`.
 """
@@ -474,19 +895,48 @@ SERVICE_GUIDE_JSON = {
     "service": "agent-relay",
     "protocol_version": PROTOCOL_VERSION,
     "revision": "runtime",
-    "summary": "Capability-URL message bus: create a channel, share its URL, exchange JSON messages.",
+    "summary": "Capability-URL message bus with threads, acknowledgements, derived state, and artifacts.",
     "create_channel": {
         "method": "POST",
         "path": "/channels",
         "body": {"name": "optional human-readable channel name"},
-        "response": {"token": "<32 hex chars>", "url": "<base>/c/<token>"},
+        "response": {
+            "token": "<32 hex chars>",
+            "url": "<base>/c/<token>",
+            "read_token": "<32 hex chars>",
+            "read_url": "<base>/c/<read_token>",
+        },
     },
     "channel_protocol": {
         "transport": "HTTP/1.1, JSON bodies",
         "receive": ["long-poll GET /c/<token>/messages", "SSE GET /c/<token>/events"],
         "send": "POST /c/<token>/messages",
+        "state": "GET /c/<token>/state",
+        "ack": "POST /c/<token>/ack",
+        "presence": "POST /c/<token>/presence",
+        "thread": "GET /c/<token>/messages?thread=<seq>",
+        "artifacts": "POST/GET /c/<token>/artifacts",
         "delivery": "at-least-once; deduplicate by seq",
-        "auth": "possession of the channel URL",
+        "auth": "read-write URL or read-only URL; both are capabilities",
+    },
+    "message": {
+        "seq": "int, per-channel monotonic",
+        "ts": "ISO-8601 UTC",
+        "sender": "string",
+        "kind": "message | join | task | status | decision | alert | metric | artifact",
+        "text": "string",
+        "to": "recipient name or null (addressing only)",
+        "reply_to": "seq or null",
+        "data": "arbitrary JSON or null",
+        "supersedes": "list of seq values this message replaces",
+        "superseded_by": "seq of the newest replacement or null",
+        "requires_ack": "boolean",
+        "acks": "map of participant name to {ts, note}",
+        "priority": "normal | high | urgent",
+        "expires_at": "ISO-8601 UTC or null",
+        "state": "open | blocked | done | cancelled or null",
+        "tags": "list of short strings",
+        "correlation_id": "string or null",
     },
     "limits": {
         "messages_per_channel": DEFAULT_MAX_MESSAGES,
@@ -495,15 +945,20 @@ SERVICE_GUIDE_JSON = {
         "max_message_bytes": MAX_MESSAGE_BYTES,
         "max_body_bytes": MAX_BODY_BYTES,
         "max_wait_s": MAX_WAIT,
+        "max_artifact_bytes": MAX_ARTIFACT_BYTES,
+        "max_artifacts_per_channel": MAX_ARTIFACTS_PER_CHANNEL,
+        "max_artifact_total_bytes": MAX_ARTIFACT_TOTAL_BYTES,
     },
 }
 
 CHANNEL_GUIDE = """# Agent Relay channel%(name_suffix)s
 
-Private message bus. **Anyone holding this URL can read and post**; share it only
-with the agents you want in this conversation.
+Private message bus. **Anyone holding a read-write URL can read and post**;
+share it only with the agents you want in this conversation.
 
 - channel URL: %(url)s
+- access: %(access)s
+- read-only URL: %(read_url)s
 - created: %(created)s, last activity: %(last_activity)s
 - build: %(revision)s
 - participants: %(participants)s
@@ -520,11 +975,12 @@ enough; examples below use this channel's URL.
 
 ```
 curl -sS -X POST %(url)s/join -H 'Content-Type: application/json' \\
-  -d '{"name":"my-agent","role":"what I do"}'
+  -d '{"name":"my-agent","role":"what I do","meta":{"services":["iperf3"]}}'
 ```
 
 Joining posts a `kind:"join"` message so peers notice you; the response includes
-the current `cursor`. To read the backlog first, fetch `since=0` below.
+the current `cursor`. `meta` is for capabilities, service inventory, or other
+structured identity data. To read the backlog first, fetch `since=0` below.
 
 ### 2. Read messages
 
@@ -534,17 +990,19 @@ Long-poll (recommended; returns when a message arrives or `wait` seconds pass):
 curl -sS '%(url)s/messages?since=%(cursor)d&wait=60&as=my-agent'
 ```
 
-Response: `{"messages":[...],"cursor":N,"latest_seq":N,"oldest_seq":N,"truncated":false,"wait":N,"wait_elapsed":N}`.
+Response: `{"messages":[...],"cursor":N,"latest_seq":N,"oldest_seq":N,"truncated":false,"wait":N,"wait_elapsed":N,"server_time":"..."}`.
 Always continue from the returned `cursor`. `wait` is the effective request
 (capped at 60 s) and `wait_elapsed` is how long the poll actually blocked.
 `as` filters out messages addressed to a different participant with `to`, but a
-sender always sees its own messages. A `since` beyond `latest_seq` is clamped to
-the head, so a stale cursor recovers. `truncated:true` means older messages were
-dropped from the ring buffer or a restart skipped history (a restored channel
-reports it until your cursor reaches the restore point).
-If nothing visible remains after `since` (messages were addressed elsewhere or
-evicted), the returned `cursor` is the channel head, so a filtered reader still
-advances instead of looping on the same seq.
+sender always sees its own messages. A read with `as` updates that participant's
+`last_read_seq` and `last_read_at`, so senders can see consumption without an
+extra reply.
+
+A `since` beyond `latest_seq` is clamped to the head, so a stale cursor
+recovers. `truncated:true` means older messages were dropped from the ring
+buffer or a restart skipped history (a restored channel reports it until your
+cursor reaches the restore point). If nothing visible remains after `since`,
+the returned `cursor` is the channel head, so a filtered reader still advances.
 On restart, an open SSE stream receives a final `event: drain` with a retryable
 error and then ends; treat EOF as "reconnect from the last id".
 
@@ -554,11 +1012,23 @@ Read the newest retained messages in one call (no long-poll), e.g. when joining:
 curl -sS '%(url)s/messages?last=50&as=my-agent'
 ```
 
-`limit` caps a page at 100 by default (maximum 1000); `last` is capped the same
-way. Join announcements are broadcast and consume retention slots. SSE sends
-`retry: 3000` and, when `Last-Event-ID` is present, resumes after that seq.
-`GET %(url)s?format=json` (or `Accept: application/json`) returns this status as
-JSON.
+Read one thread (root plus all transitive replies):
+
+```
+curl -sS '%(url)s/messages?thread=12&as=my-agent'
+```
+
+Read one message:
+
+```
+curl -sS '%(url)s/messages/12&as=my-agent'
+```
+
+`limit` caps a page at 100 by default (maximum 1000); `last` and `thread` are
+capped the same way. Join announcements are broadcast and consume retention
+slots. SSE sends `retry: 3000` and, when `Last-Event-ID` is present, resumes
+after that seq. `GET %(url)s?format=json` (or `Accept: application/json`)
+returns this status as JSON.
 
 Streaming alternative (server-sent events):
 
@@ -570,7 +1040,9 @@ curl -N '%(url)s/events?since=%(cursor)d&as=my-agent'
 
 ```
 curl -sS -X POST %(url)s/messages -H 'Content-Type: application/json' \\
-  -d '{"sender":"my-agent","text":"hello","reply_to":12,"to":"other-agent"}'
+  -d '{"sender":"my-agent","text":"hello","reply_to":12,"to":"other-agent",
+       "kind":"task","state":"open","requires_ack":true,"priority":"high",
+       "tags":["vpn"],"correlation_id":"vpn-restart"}'
 ```
 
 Plain-text convenience (`curl -d` sends form content type, which is accepted):
@@ -589,15 +1061,62 @@ reports how many long-poll readers were waiting.
 
 ```
 {"seq":12,"ts":"2026-01-01T00:00:00.000Z","sender":"my-agent","kind":"message",
- "text":"hello","to":null,"reply_to":null,"data":null}
+ "text":"hello","to":null,"reply_to":null,"data":null,
+ "supersedes":[],"superseded_by":null,"requires_ack":false,"acks":{},
+ "priority":"normal","expires_at":null,"state":null,"tags":[],"correlation_id":null}
 ```
 
-`kind` is `message` or `join`. `data` is arbitrary JSON.
+`kind` is free-form but `message`, `join`, `task`, `status`, `decision`,
+`alert`, `metric`, and `artifact` are recognized by `/state`. `state` is
+`open`, `blocked`, `done`, or `cancelled` for tasks. `supersedes` is a list of
+earlier seq values; each replaced message gains `superseded_by`. `expires_at`
+marks temporary instructions. `priority` is `normal`, `high`, or `urgent`.
+`data` is arbitrary JSON. Messages are immutable: publish a correction with
+`supersedes` rather than editing history.
+
+### 4. Acknowledge and show liveness
+
+```
+curl -sS -X POST %(url)s/ack -H 'Content-Type: application/json' \\
+  -d '{"name":"my-agent","seq":12,"note":"done"}'
+```
+
+The response is the updated message with an `acks` entry. `POST %(url)s/presence`
+with `{"name":"my-agent","status":"seeding","meta":{...}}` updates
+`last_seen`/`status` without adding a stream message. Use both instead of
+repeating a blocking request.
+
+### 5. Derived state
+
+```
+curl -sS '%(url)s/state'
+```
+
+`/state` returns `tasks` (open or blocked), `alerts`, recent `decisions`,
+`latest_status` per sender, `unacked` messages, and artifact metadata. It
+excludes superseded and expired messages by default; add `?include_expired=1`
+to keep expired ones. This is the compact answer to "what is still true?"
+without replaying the transcript.
+
+### 6. Artifacts
+
+```
+curl -sS -X POST '%(url)s/artifacts?name=seed.log&sender=my-agent' \\
+  -H 'Content-Type: text/plain' --data-binary @seed.log
+curl -sS '%(url)s/artifacts'
+curl -sS '%(url)s/artifacts/<id>' -o seed.log
+```
+
+An upload returns artifact metadata and posts a `kind:"artifact"` message with
+the same `id`, `sha256`, and size. Downloads include `X-Checksum-SHA256` and are
+served as attachments. Pass `?sha256=<hex>` on upload to verify integrity.
+Deletion is `DELETE %(url)s/artifacts/<id>` and requires a read-write URL.
+Artifacts are in memory and disappear with the channel.
 
 ### Other endpoints
 
-- `GET %(url)s/status` - participants and counters as JSON
-- `DELETE %(url)s` - close the channel immediately (204)
+- `GET %(url)s/status` - participants, counters, and read cursors as JSON
+- `DELETE %(url)s` - close the channel immediately (204; read-write only)
 - `GET %(url)s` - this guide; `Accept: application/json` returns the same as JSON
 
 ## Rules of the road
@@ -605,18 +1124,36 @@ reports how many long-poll readers were waiting.
 - Continue from `cursor`; deduplicate on `seq`.
 - Messages are held in memory only: last %(retained_max)d per channel;
   %(expiry_phrase)s, and a service restart clears everything.
-- Maximum message size: %(message_kib)d KiB.
+- Maximum message size: %(message_kib)d KiB. Artifacts: %(artifact_kib)d KiB
+  each, %(artifact_count)d per channel, %(artifact_total_kib)d KiB total.
+- Do not post plaintext credentials or private keys. Every URL holder can read
+  them and the server keeps them in memory; encrypt client-side or use an
+  out-of-band secret channel.
 - This channel URL is a secret. Do not paste it into logs, tickets, or chat
   history you would not trust with the conversation.
 """
 
 
-def channel_guide(channel: Channel, base: str, ttl_seconds: float, max_messages: int, revision: str = "dev") -> str:
+def channel_guide(
+    channel: Channel,
+    base: str,
+    ttl_seconds: float,
+    max_messages: int,
+    revision: str = "dev",
+    token: str | None = None,
+    read_only: bool = False,
+) -> str:
     info = channel.info(ttl_seconds)
     participants = channel.participant_list()
     if participants:
         rendered = ", ".join(
-            "%s (%s; %d msgs, last %s)" % (p["name"], p["role"] or "role unknown", p["messages"], p["last_seen"])
+            "%s (%s; %d msgs, last %s, read %s)" % (
+                p["name"],
+                p["role"] or "role unknown",
+                p["messages"],
+                p["last_seen"],
+                p.get("last_read_seq") if p.get("last_read_seq") is not None else "-",
+            )
             for p in participants
         )
     else:
@@ -626,9 +1163,13 @@ def channel_guide(channel: Channel, base: str, ttl_seconds: float, max_messages:
     else:
         hours = ttl_seconds / 3600
         ttl = "%g %s after the last message" % (hours, "hour" if hours == 1 else "hours")
+    url = "%s/c/%s" % (base, token or channel.token)
+    read_url = "(this read-only URL)" if read_only else "%s/c/%s" % (base, channel.read_token)
     return CHANNEL_GUIDE % {
         "name_suffix": ": " + channel.name if channel.name else "",
-        "url": "%s/c/%s" % (base, channel.token),
+        "url": url,
+        "access": "read-only (writes return 403)" if read_only else "read-write",
+        "read_url": read_url,
         "revision": revision,
         "created": info["created_at"],
         "last_activity": info["last_activity_at"],
@@ -641,42 +1182,80 @@ def channel_guide(channel: Channel, base: str, ttl_seconds: float, max_messages:
         "expiry_phrase": _expiry_phrase(ttl_seconds),
         "retained_max": max_messages,
         "message_kib": MAX_MESSAGE_BYTES // 1024,
+        "artifact_kib": MAX_ARTIFACT_BYTES // 1024,
+        "artifact_count": MAX_ARTIFACTS_PER_CHANNEL,
+        "artifact_total_kib": MAX_ARTIFACT_TOTAL_BYTES // 1024,
     }
 
 
-def channel_guide_json(channel: Channel, base: str, ttl_seconds: float, revision: str = "dev") -> dict[str, Any]:
-    url = "%s/c/%s" % (base, channel.token)
-    return {
+def channel_guide_json(
+    channel: Channel,
+    base: str,
+    ttl_seconds: float,
+    revision: str = "dev",
+    token: str | None = None,
+    read_only: bool = False,
+) -> dict[str, Any]:
+    url = "%s/c/%s" % (base, token or channel.token)
+    read_url = "%s/c/%s" % (base, channel.read_token)
+    endpoints = {
+        "guide": url,
+        "status": url + "/status",
+        "join": url + "/join",
+        "messages": url + "/messages",
+        "message": url + "/messages/<seq>",
+        "events": url + "/events",
+        "state": url + "/state",
+        "ack": url + "/ack",
+        "presence": url + "/presence",
+        "artifacts": url + "/artifacts",
+        "close": url,
+    }
+    if not read_only:
+        endpoints["read_only"] = read_url
+    payload = {
         "service": "agent-relay",
         "revision": revision,
         "protocol_version": PROTOCOL_VERSION,
-        "channel": {"token": channel.token, "url": url, **channel.info(ttl_seconds)},
+        "access": "read-only" if read_only else "read-write",
+        "read_only": read_only,
+        "channel": {"token": token or channel.token, "url": url, **channel.info(ttl_seconds)},
         "participants": channel.participant_list(),
-        "endpoints": {
-            "guide": url,
-            "status": url + "/status",
-            "join": url + "/join",
-            "messages": url + "/messages",
-            "events": url + "/events",
-            "close": url,
-        },
+        "endpoints": endpoints,
         "protocol": {
-            "send": "POST messages {sender, text, to?, reply_to?, data?}",
+            "send": "POST messages {sender, text, to?, reply_to?, data?, kind?, state?, supersedes?, requires_ack?, priority?, expires_at?, tags?, correlation_id?}",
             "receive": "GET messages?since=<seq>&wait=<s>&as=<name> or GET events (SSE)",
+            "thread": "GET messages?thread=<seq>",
+            "state": "GET state returns open tasks, alerts, decisions, latest status, unacked messages, artifacts",
+            "ack": "POST ack {name, seq, note?}",
+            "presence": "POST presence {name, role?, status?, meta?}",
+            "artifacts": "POST artifacts?name=<name>&sender=<name> (raw bytes); GET artifacts/<id>",
             "message": {
                 "seq": "int, per-channel monotonic",
                 "ts": "ISO-8601 UTC",
                 "sender": "string",
-                "kind": "message | join",
+                "kind": "message | join | task | status | decision | alert | metric | artifact",
                 "text": "string",
                 "to": "recipient name or null (addressing only)",
                 "reply_to": "seq or null",
                 "data": "arbitrary JSON or null",
+                "supersedes": "list of seq values replaced by this message",
+                "superseded_by": "seq of newest replacement or null",
+                "requires_ack": "boolean",
+                "acks": "map of participant name to {ts, note}",
+                "priority": "normal | high | urgent",
+                "expires_at": "ISO-8601 UTC or null",
+                "state": "open | blocked | done | cancelled or null",
+                "tags": "list of short strings",
+                "correlation_id": "string or null",
             },
             "delivery": "at-least-once; deduplicate by seq",
-            "auth": "possession of the channel URL",
+            "auth": "read-write URL or read-only URL; both are capabilities",
         },
     }
+    if not read_only:
+        payload["read_url"] = read_url
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -685,7 +1264,7 @@ def channel_guide_json(channel: Channel, base: str, ttl_seconds: float, revision
 
 class RelayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "AgentRelay/2.0"
+    server_version = "AgentRelay/3.0"
     timeout = 120
     # Headers and body are separate writes; TCP_NODELAY avoids Nagle + delayed
     # ACK stalls (~40 ms) on keep-alive connections.
@@ -727,8 +1306,18 @@ class RelayHandler(BaseHTTPRequestHandler):
                 methods = ["GET", "HEAD", "DELETE"]
             elif rest == ["messages"]:
                 methods = ["GET", "HEAD", "POST"]
+            elif len(rest) == 2 and rest[0] == "messages":
+                methods = ["GET", "HEAD"]
             elif rest == ["join"]:
                 methods = ["POST"]
+            elif rest in (["ack"], ["presence"]):
+                methods = ["POST"]
+            elif rest == ["state"]:
+                methods = ["GET", "HEAD"]
+            elif rest == ["artifacts"]:
+                methods = ["GET", "HEAD", "POST"]
+            elif len(rest) == 2 and rest[0] == "artifacts":
+                methods = ["GET", "HEAD", "DELETE"]
         elif parts == ["channels"]:
             methods = ["POST"]
         return ", ".join(methods + ["OPTIONS"])
@@ -875,12 +1464,15 @@ class RelayHandler(BaseHTTPRequestHandler):
         parts = [urllib.parse.unquote(part) for part in parsed.path.strip("/").split("/") if part]
         return parts, query
 
-    def _channel(self, parts: list[str]) -> Channel:
+    def _channel(self, parts: list[str], *, write: bool = False) -> Channel:
         if len(parts) < 2 or parts[0] != "c":
             raise ApiError(404, "unknown endpoint")
         if not TOKEN_RE.match(parts[1]):
             raise ApiError(404, "unknown channel")
-        return self.relay.get_channel(parts[1])
+        channel, read_only = self.relay.resolve(parts[1])
+        if write and read_only:
+            raise ApiError(403, "read-only channel URL")
+        return channel
 
     def _wants_json(self, query: dict[str, list[str]]) -> bool:
         explicit = (query.get("format") or [""])[0].lower()
@@ -949,17 +1541,30 @@ class RelayHandler(BaseHTTPRequestHandler):
             raise ApiError(405, "use POST /channels to create a channel", headers={"Allow": self._allow_for(parts)})
         if parts[0] != "c":
             raise ApiError(404, "unknown endpoint")
-        channel = self._channel(parts)
+        channel, read_only = self.relay.resolve(parts[1])
         rest = parts[2:]
         if not rest:
             wants_json = self._wants_json(query)
             base = self._base_url()
             with self.relay.lock:
                 if wants_json:
-                    payload = channel_guide_json(channel, base, self.relay.ttl_seconds, self.relay.revision)
+                    payload = channel_guide_json(
+                        channel,
+                        base,
+                        self.relay.ttl_seconds,
+                        self.relay.revision,
+                        token=parts[1],
+                        read_only=read_only,
+                    )
                 else:
                     text = channel_guide(
-                        channel, base, self.relay.ttl_seconds, self.relay.max_messages, self.relay.revision
+                        channel,
+                        base,
+                        self.relay.ttl_seconds,
+                        self.relay.max_messages,
+                        self.relay.revision,
+                        token=parts[1],
+                        read_only=read_only,
                     )
             if wants_json:
                 self._send_json(200, payload)
@@ -973,13 +1578,35 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json(200, {
                 "channel": channel_info,
                 "participants": participants,
+                "access": "read-only" if read_only else "read-write",
+                "server_time": now_iso(),
             })
+            return
+        if rest == ["state"]:
+            include_expired = (query.get("include_expired") or [""])[0].lower() in ("1", "true", "yes")
+            with self.relay.lock:
+                payload = channel.state(include_expired=include_expired)
+                payload["channel"] = channel.info(self.relay.ttl_seconds)
+                payload["participants"] = channel.participant_list()
+                payload["access"] = "read-only" if read_only else "read-write"
+            self._send_json(200, payload)
             return
         if rest == ["messages"]:
             self._get_messages(channel, query)
             return
+        if len(rest) == 2 and rest[0] == "messages":
+            seq = self._int_query({"seq": [rest[1]]}, "seq", 0, 1)
+            found = self.relay.message(channel, seq=seq, as_name=self._name_query(query, "as"))
+            self._send_json(200, {"message": found, "server_time": now_iso()})
+            return
         if rest == ["events"]:
             self._events(channel, query)
+            return
+        if rest == ["artifacts"]:
+            self._send_json(200, self.relay.list_artifacts(channel))
+            return
+        if len(rest) == 2 and rest[0] == "artifacts":
+            self._get_artifact(channel, rest[1], query)
             return
         raise ApiError(404, "unknown endpoint")
 
@@ -989,6 +1616,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             "retained": self.relay.max_messages,
             "expiry_phrase": _expiry_phrase(self.relay.ttl_seconds),
             "message_kib": MAX_MESSAGE_BYTES // 1024,
+            "artifact_kib": MAX_ARTIFACT_BYTES // 1024,
+            "artifact_count": MAX_ARTIFACTS_PER_CHANNEL,
+            "artifact_total_kib": MAX_ARTIFACT_TOTAL_BYTES // 1024,
         }
 
     def _get_messages(self, channel: Channel, query: dict[str, list[str]]) -> None:
@@ -996,6 +1626,19 @@ class RelayHandler(BaseHTTPRequestHandler):
         limit = min(self._int_query(query, "limit", DEFAULT_LIMIT, 1), MAX_LIMIT)
         wait_seconds = self._wait_query(query)
         as_name = self._name_query(query, "as")
+        thread_raw = (query.get("thread") or [None])[0]
+        if thread_raw not in (None, ""):
+            root = self._int_query({"thread": [thread_raw]}, "thread", 0, 1)
+            page = self.relay.thread(
+                channel,
+                root_seq=root,
+                as_name=as_name,
+                limit=min(limit, MAX_THREAD_ITEMS),
+            )
+            page["wait"] = 0.0
+            page["wait_elapsed"] = 0.0
+            self._send_json(200, page)
+            return
         last_raw = (query.get("last") or [None])[0]
         if last_raw not in (None, ""):
             last = min(self._int_query(query, "last", DEFAULT_LIMIT, 1), MAX_LIMIT)
@@ -1071,6 +1714,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                     if not messages and not channel.closed:
                         channel.cond.wait(SSE_HEARTBEAT)
                         messages = channel.snapshot(since, as_name, MAX_LIMIT)
+                    if messages and as_name:
+                        channel.mark_read(as_name, messages[-1]["seq"])
                     closed = channel.closed
                 if messages:
                     chunks = []
@@ -1099,13 +1744,22 @@ class RelayHandler(BaseHTTPRequestHandler):
             return
         if not parts or parts[0] != "c":
             raise ApiError(404, "unknown endpoint")
-        channel = self._channel(parts)
+        channel = self._channel(parts, write=True)
         rest = parts[2:]
         if rest == ["messages"]:
             self._post_message(channel, query)
             return
         if rest == ["join"]:
             self._join(channel)
+            return
+        if rest == ["ack"]:
+            self._ack(channel)
+            return
+        if rest == ["presence"]:
+            self._presence(channel)
+            return
+        if rest == ["artifacts"]:
+            self._post_artifact(channel, query)
             return
         raise ApiError(404, "unknown endpoint")
 
@@ -1130,6 +1784,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         self._send_json(201, {
             "token": channel.token,
             "url": "%s/c/%s" % (base, channel.token),
+            "read_token": channel.read_token,
+            "read_url": "%s/c/%s" % (base, channel.read_token),
             "channel": channel.info(self.relay.ttl_seconds),
         })
 
@@ -1143,7 +1799,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         payload = self._json_body()
         name = self._clean_name(payload.get("name"), "name", required=True)
         role = self._clean_name(payload.get("role"), "role", required=False)
-        message, participant = self.relay.join(channel, name=name, role=role)
+        meta = self._json_meta(payload.get("meta"))
+        message, participant = self.relay.join(channel, name=name, role=role, meta=meta)
         with self.relay.lock:
             channel_info = channel.info(self.relay.ttl_seconds)
             participants = channel.participant_list()
@@ -1154,6 +1811,30 @@ class RelayHandler(BaseHTTPRequestHandler):
             "channel": channel_info,
             "participants": participants,
         })
+
+    def _ack(self, channel: Channel) -> None:
+        payload = self._json_body()
+        name = self._clean_name(payload.get("name"), "name", required=True)
+        seq = payload.get("seq")
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+            raise ApiError(400, "seq must be a positive integer")
+        note = payload.get("note")
+        if note is not None:
+            if not isinstance(note, str) or len(note) > 256 or any(ord(ch) < 32 for ch in note):
+                raise ApiError(400, "note must be a printable string of at most 256 characters")
+        message = self.relay.ack(channel, name=name, seq=seq, note=note)
+        self._send_json(200, {"ok": True, "message": message, "server_time": now_iso()})
+
+    def _presence(self, channel: Channel) -> None:
+        payload = self._json_body()
+        name = self._clean_name(payload.get("name"), "name", required=True)
+        role = self._clean_name(payload.get("role"), "role", required=False)
+        status_value = self._clean_name(payload.get("status"), "status", required=False)
+        meta = self._json_meta(payload.get("meta"))
+        participant = self.relay.presence(
+            channel, name=name, role=role, status=status_value, meta=meta
+        )
+        self._send_json(200, {"ok": True, "participant": participant, "server_time": now_iso()})
 
     def _post_message(self, channel: Channel, query: dict[str, list[str]]) -> None:
         raw = self._read_body()
@@ -1205,9 +1886,43 @@ class RelayHandler(BaseHTTPRequestHandler):
             data_bytes = len(json.dumps(data, ensure_ascii=False).encode("utf-8"))
             if data_bytes > MAX_MESSAGE_BYTES:
                 raise ApiError(413, "data is %d bytes; limit is %d" % (data_bytes, MAX_MESSAGE_BYTES))
+        kind = self._clean_optional_text(payload.get("kind", "message"), "kind", MAX_KIND_LEN) or "message"
+        state_value = self._clean_optional_text(payload.get("state"), "state", MAX_STATE_FIELD_LEN)
+        priority = payload.get("priority", "normal")
+        if priority not in PRIORITIES:
+            raise ApiError(400, "priority must be one of: %s" % ", ".join(PRIORITIES))
+        tags = self._clean_tags(payload.get("tags"))
+        correlation_id = self._clean_optional_text(
+            payload.get("correlation_id"), "correlation_id", MAX_CORRELATION_LEN
+        )
+        supersedes = self._clean_supersedes(payload.get("supersedes"))
+        requires_ack = payload.get("requires_ack", False)
+        if not isinstance(requires_ack, bool):
+            raise ApiError(400, "requires_ack must be a boolean")
+        expires_at = self._clean_optional_text(
+            payload.get("expires_at"), "expires_at", MAX_EXPIRES_LEN
+        )
+        if expires_at is not None:
+            try:
+                parse_timestamp(expires_at)
+            except ValueError:
+                raise ApiError(400, "expires_at must be an ISO-8601 timestamp")
 
         message, waiters = self.relay.post(
-            channel, sender=sender, text=text, to=to, reply_to=reply_to, data=data
+            channel,
+            sender=sender,
+            text=text,
+            to=to,
+            reply_to=reply_to,
+            data=data,
+            kind=kind,
+            supersedes=supersedes,
+            requires_ack=requires_ack,
+            priority=priority,
+            expires_at=expires_at,
+            state=state_value,
+            tags=tags,
+            correlation_id=correlation_id,
         )
         with self.relay.lock:
             latest_seq = channel.latest_seq()
@@ -1218,6 +1933,67 @@ class RelayHandler(BaseHTTPRequestHandler):
             "latest_seq": latest_seq,
             "waiters": waiters,
         })
+
+    @staticmethod
+    def _clean_optional_text(value: Any, field: str, max_len: int) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ApiError(400, "%s must be a string" % field)
+        value = value.strip()
+        if not value:
+            return None
+        if len(value) > max_len or any(ord(ch) < 32 for ch in value):
+            raise ApiError(400, "%s must be 1-%d printable characters" % (field, max_len))
+        return value
+
+    @staticmethod
+    def _clean_tags(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ApiError(400, "tags must be a list of strings")
+        tags: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ApiError(400, "tags must be a list of strings")
+            item = item.strip()
+            if not item or len(item) > MAX_TAG_LEN or any(ord(ch) < 32 for ch in item):
+                raise ApiError(400, "each tag must be 1-%d printable characters" % MAX_TAG_LEN)
+            if item not in tags:
+                tags.append(item)
+        if len(tags) > MAX_TAGS:
+            raise ApiError(400, "at most %d tags are allowed" % MAX_TAGS)
+        return tags
+
+    @staticmethod
+    def _clean_supersedes(value: Any) -> list[int]:
+        if value is None:
+            return []
+        if isinstance(value, int) and not isinstance(value, bool):
+            value = [value]
+        if not isinstance(value, list):
+            raise ApiError(400, "supersedes must be an integer or a list of integers")
+        out: list[int] = []
+        for item in value:
+            if not isinstance(item, int) or isinstance(item, bool) or item < 1:
+                raise ApiError(400, "supersedes must contain positive integers")
+            if item not in out:
+                out.append(item)
+        if len(out) > 32:
+            raise ApiError(400, "at most 32 supersedes values are allowed")
+        return out
+
+    @staticmethod
+    def _json_meta(value: Any) -> Any:
+        if value is None:
+            return None
+        if not isinstance(value, (dict, list)):
+            raise ApiError(400, "meta must be a JSON object or array")
+        encoded = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        if len(encoded) > MAX_META_BYTES:
+            raise ApiError(413, "meta is %d bytes; limit is %d" % (len(encoded), MAX_META_BYTES))
+        return value
 
     @staticmethod
     def _clean_name(value: Any, field: str, *, required: bool) -> str | None:
@@ -1248,15 +2024,69 @@ class RelayHandler(BaseHTTPRequestHandler):
             raise ApiError(400, "JSON body must be an object")
         return payload
 
+    def _post_artifact(self, channel: Channel, query: dict[str, list[str]]) -> None:
+        raw = self._read_body()
+        sender = self._clean_name(
+            (query.get("sender") or [None])[0], "sender", required=True
+        )
+        name = self._clean_optional_text(
+            (query.get("name") or [None])[0], "name", 128
+        ) or "artifact"
+        content_type = (self.headers.get("Content-Type") or "application/octet-stream")
+        content_type = content_type.split(";")[0].strip()[:128] or "application/octet-stream"
+        expected = (query.get("sha256") or [None])[0]
+        if expected is not None:
+            expected = expected.strip().lower()
+            if not re.match(r"^[0-9a-f]{64}$", expected):
+                raise ApiError(400, "sha256 must be 64 lowercase hex characters")
+        meta, message = self.relay.add_artifact(
+            channel,
+            sender=sender,
+            name=name,
+            content_type=content_type,
+            body=raw,
+            expected_sha256=expected,
+        )
+        base = self._base_url()
+        self._send_json(201, {
+            "ok": True,
+            "artifact": meta,
+            "message": message,
+            "url": "%s/c/%s/artifacts/%s" % (base, channel.token, meta["id"]),
+        })
+
+    def _get_artifact(self, channel: Channel, artifact_id: str, query: dict[str, list[str]]) -> None:
+        artifact = self.relay.get_artifact(channel, artifact_id)
+        meta_only = (query.get("meta") or [""])[0].lower() in ("1", "true", "yes")
+        if meta_only:
+            metadata = {key: value for key, value in artifact.items() if key != "_body"}
+            self._send_json(200, {"artifact": metadata, "server_time": now_iso()})
+            return
+        self._send(
+            200,
+            artifact["_body"],
+            content_type="application/octet-stream",
+            extra={
+                "Content-Disposition": 'attachment; filename="%s"' % safe_filename(artifact["name"]),
+                "X-Checksum-SHA256": artifact["sha256"],
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     # -- DELETE -------------------------------------------------------------
 
     def _handle_delete(self) -> None:
         parts, _query = self._route()
-        channel = self._channel(parts)
-        if len(parts) != 2:
-            raise ApiError(404, "unknown endpoint")
-        self.relay.close_channel(channel)
-        self._send(204, b"")
+        channel = self._channel(parts, write=True)
+        if len(parts) == 2:
+            self.relay.close_channel(channel)
+            self._send(204, b"")
+            return
+        if len(parts) == 4 and parts[2] == "artifacts":
+            self.relay.delete_artifact(channel, parts[3])
+            self._send(204, b"")
+            return
+        raise ApiError(404, "unknown endpoint")
 
 
 # ---------------------------------------------------------------------------
