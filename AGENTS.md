@@ -4,10 +4,11 @@
 
 Agent Relay is a single-file, zero-dependency HTTP message bus for agent-to-agent
 collaboration. A caller creates a channel with `POST /channels`; the returned
-`/c/<token>` URL is both the credential and the documentation. Anyone holding
-that URL can read and post; channels are isolated by 128-bit random tokens.
-Typical use: a hardware-in-the-loop rig agent and a firmware agent exchange
-requirements and results without humans copy/pasting chat messages.
+`/c/<token>` URL is both the credential and the documentation. Each channel has
+a read-write URL and a stable read-only URL, and channels are isolated by
+128-bit random tokens. Typical use: a hardware-in-the-loop rig agent and a
+firmware agent exchange requirements, results, state, and bounded artifacts
+without humans copy/pasting chat messages.
 
 ## Architecture & Data Flow
 
@@ -15,9 +16,9 @@ requirements and results without humans copy/pasting chat messages.
 
 1. **State** (`ApiError`, `Channel`, `Relay`): an in-memory dict of channels.
    Each channel owns a monotonic `seq`, a bounded `deque` ring buffer, a
-   participant registry, waiter count, and a `threading.Condition` that shares
-   the relay-wide `RLock`. TTL expiry is lazy on access plus a background GC
-   thread.
+   participant registry with read cursors, bounded artifact storage, waiter
+   count, and a `threading.Condition` that shares the relay-wide `RLock`. TTL
+   expiry is lazy on access plus a background GC thread.
 2. **Documentation** (`SERVICE_GUIDE`, `CHANNEL_GUIDE`, `channel_guide`,
    `channel_guide_json`): Markdown and JSON self-descriptions rendered with the
    request's base URL, so a bare channel URL teaches the full protocol.
@@ -25,14 +26,15 @@ requirements and results without humans copy/pasting chat messages.
    `ThreadingHTTPServer` with manual path/query routing, body validation, long-
    poll, and server-sent events.
 
-Request flow: route path/query → validate token under `relay.lock` → parse and
-validate body/params → mutate or snapshot `Relay` under the lock → send JSON or
-Markdown. A post appends to the ring buffer, increments `seq`, updates the
-sender's participant record, and `notify_all()`s the channel condition. Readers
-block until `seq > since` or `wait` expires. SSE holds the connection thread,
-writes `id:`/`data:` frames, and pings every 15 s. `seq` is the cursor; delivery
-is at-least-once; `since` older than the retained range returns
-`truncated: true`.
+Request flow: route path/query → resolve read-write or read-only token under
+`relay.lock` → parse and validate body/params → mutate or snapshot `Relay` under
+the lock → send JSON or Markdown. A post appends the v3 envelope to the ring
+buffer, increments `seq`, marks `supersedes` targets, updates the sender's
+participant record, and `notify_all()`s the channel condition. Readers block
+until `seq > since` or `wait` expires and update `last_read_seq` when identified.
+SSE holds the connection thread, writes `id:`/`data:` frames, and pings every
+15 s. `seq` is the cursor; delivery is at-least-once; `since` older than the
+retained range returns `truncated: true`.
 
 ```
 client ──POST /channels──────────────► Relay.create_channel ──► token + URL
@@ -76,7 +78,7 @@ The repo carries a vendored `.wolf/` memory tree and `.claude/` hooks from
 
 ```bash
 make run                    # python3 relay.py --host 127.0.0.1 --port 8787
-make test                   # pytest -q (49 end-to-end tests)
+make test                   # pytest -q (60 end-to-end tests)
 make smoke                  # bash scripts/smoke.sh on SMOKE_PORT=8791
 python3 -m py_compile relay.py   # fast syntax check
 PORT=9000 make run          # alternate port
@@ -115,26 +117,33 @@ third-party packages.
   I/O: long-poll uses `cond.wait`, SSE snapshots under the lock and writes
   outside it. Blocking work in a post handler must stay short.
 - **Validation and limits.** Reuse `_clean_name` (1–64 printable characters for
-  `sender`, `to`, join `name`, `role`), `_int_query`, `_wait_query`, and the
-  `MAX_*` constants. Oversized bodies are drained up to 8 MiB where possible
-  and rejected with JSON 413; oversized message text/data is rejected before
-  mutation.
-- **Wire schema is stable.** Messages always carry `seq`, `ts`, `sender`,
-  `kind`, `text`, `to`, `reply_to`, `data`. `to` is addressing, not access
-  control; all URL holders can read everything. A reader using `as=<name>` sees
-  broadcasts plus messages addressed to it plus its own messages, even when its
-  own message is addressed elsewhere. Cursors past `latest_seq` are clamped to
-  the head; an empty filtered read also returns the head as `cursor`, so `as`
-  readers always advance. Extend with new `kind` values rather than changing or
-  reusing fields.
+  `sender`, `to`, join `name`/`role`, and presence `status`),
+  `_clean_optional_text`, `_clean_tags`, `_clean_supersedes`, `_json_meta`,
+  `_int_query`, `_wait_query`, and the `MAX_*` constants. Oversized bodies are
+  drained up to 8 MiB where possible and rejected with JSON 413; oversized
+  message text/data/artifacts are rejected before mutation.
+- **Wire schema is stable and additive.** Messages always carry `seq`, `ts`,
+  `sender`, `kind`, `text`, `to`, `reply_to`, `data`, `supersedes`,
+  `superseded_by`, `requires_ack`, `acks`, `priority`, `expires_at`, `state`,
+  `tags`, and `correlation_id`. `to` is addressing, not access control; all URL
+  holders can read everything. A reader using `as=<name>` sees broadcasts plus
+  messages addressed to it plus its own messages, even when its own message is
+  addressed elsewhere. Cursors past `latest_seq` are clamped to the head; an
+  empty filtered read also returns the head as `cursor`, so `as` readers always
+  advance. Extend with new `kind` values rather than changing or reusing fields.
+- **Coordination state is derived, not stored twice.** `Channel.state()` follows
+  `superseded_by` and `expires_at`, then reports tasks, alerts, decisions,
+  latest status, unacked messages, and artifact metadata. `Channel.thread()`
+  walks `reply_to` descendants. Acks mutate the message's `acks` map; presence
+  and reads update participant fields without posting.
 - **Self-documenting behavior is part of the API.** Any endpoint, limit, flag,
   or semantic change must update `SERVICE_GUIDE`, `CHANNEL_GUIDE`, their JSON
   variants, and `README.md`. Guides use `%`-formatting with `%(key)s`
   placeholders because the templates contain literal JSON braces.
 - **Capability-URL hygiene.** Never log full tokens (`mask_tokens`), never add
   channel listings, keep `no-store`, and require `--admin-token` for creation
-  only when the deployment is exposed beyond a trusted network. The URL also
-  authorizes `DELETE`, which is the only revocation path.
+  only when the deployment is exposed beyond a trusted network. The read-write
+  URL authorizes writes and `DELETE`; the read-only URL is safe for observers.
 - **License.** The repository is AGPL-3.0 (`LICENSE`); `.wolf/` and `.claude/`
   are vendored epicwolf files under the same license. Keep attribution intact.
 
@@ -143,7 +152,7 @@ third-party packages.
 | Path | What it is |
 | --- | --- |
 | `relay.py` | Entire service: state, guides, HTTP handler, SSE, CLI |
-| `tests/test_relay.py` | 49 end-to-end tests over ephemeral real servers |
+| `tests/test_relay.py` | 60 end-to-end tests over ephemeral real servers |
 | `tests/conftest.py` | Adds repo root to `sys.path` so `import relay` works |
 | `scripts/smoke.sh` | Curl+python3 smoke test; starts its own server on `PORT` (set from `SMOKE_PORT`) |
 | `Makefile` | `run`, `test`, `smoke` targets and overridable variables |
@@ -170,10 +179,10 @@ Key entry points: `main()` for the process, `make_server()` for tests/embedding,
   `Content-Length`; chunked uploads are not supported. `TCP_NODELAY` is on
   (`disable_nagle_algorithm`) to avoid ~40 ms keep-alive stalls; SSE honors
   `Last-Event-ID` and emits `retry: 3000`.
-- **State is in memory.** A restart forgets all channels; channels expire after
-  `--channel-ttl-hours` without a new message (reads do not refresh the clock)
-  and are capped at `--max-messages` retained messages. Do not assume
-  persistence.
+- **State is in memory.** A restart forgets all channels, messages, and
+  artifacts; channels expire after `--channel-ttl-hours` without a new message
+  (reads/presence do not refresh the clock) and are capped at `--max-messages`
+  retained messages. Do not assume persistence.
 - **Configuration is flags plus environment.** `--host` (127.0.0.1),
   `--port` (8787), `--public-url`, `--max-messages` (2000),
   `--channel-ttl-hours` (168; 0 disables expiry), `--max-channels` (10000),
@@ -212,12 +221,15 @@ Key entry points: `main()` for the process, `make_server()` for tests/embedding,
   eviction, long-poll wakeup/timeout/waiter counts, 503 drain, waiter release on
   client disconnect and channel deletion, SSE history/live delivery, SSE drain
   events, `as` filtering, `Last-Event-ID` resume and SSE cursor clamping, tail
-  reads (`last=N`), `to` addressing and sender visibility,
-  join/presence, reply/data round-trip, TTL expiry, capacity limits,
-  forwarded-header link generation, plain-text and JSON-sniffed posts, JSON error
-  positions, clean oversized-body 413s, auto-named channels, per-path `Allow`,
-  build revision reporting, admin-token gating,
-  delete, HEAD/OPTIONS/health, and that the guides reflect effective limits.
+  reads (`last=N`), thread and single-message reads, `to` addressing and sender
+  visibility, join/presence and capability metadata, read cursors,
+  acknowledgements and unacked state, supersession, derived state, artifact
+  upload/download/hash/delete, read-only URL enforcement, reply/data round-trip,
+  TTL expiry, capacity limits, forwarded-header link generation, plain-text and
+  JSON-sniffed posts, JSON error positions, clean oversized-body 413s,
+  auto-named channels, per-path `Allow`, build revision reporting, admin-token
+  gating, delete, HEAD/OPTIONS/health, and that the guides reflect effective
+  limits.
 - Add tests at the HTTP boundary with the existing helpers (`start_server`,
   `api`, `post`, `read`, `join`, `sse`, `read_sse_event`, `wait_for_waiters`);
   assert both status code and payload. For timing-sensitive cases follow the

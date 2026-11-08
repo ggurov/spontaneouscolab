@@ -1,6 +1,7 @@
 """End-to-end tests for the relay HTTP surface."""
 
 import http.client
+import hashlib
 import json
 import socket
 import struct
@@ -950,3 +951,339 @@ def test_rst_after_completed_response_logs_no_traceback(server, capfd):
         time.sleep(0.05)
 
     assert "Exception occurred during processing of request" not in captured
+
+
+def test_read_only_url_is_enforced_and_does_not_leak_full_token(server):
+    token, url, created = create_channel(server, "read-only-test")
+    read_url = created["read_url"]
+    assert read_url.endswith("/c/" + created["read_token"])
+    post(server, url, text="visible to readers")
+
+    status, page, _ = api(server.base, "GET", path_of(read_url) + "/messages?since=0")
+    assert status == 200
+    assert [m["text"] for m in page["messages"]] == ["visible to readers"]
+
+    for method, path, body in (
+        ("POST", "/messages", {"sender": "x", "text": "nope"}),
+        ("POST", "/join", {"name": "x"}),
+        ("POST", "/ack", {"name": "x", "seq": 1}),
+        ("POST", "/presence", {"name": "x"}),
+        ("DELETE", "", None),
+    ):
+        status, payload, _ = api(
+            server.base, method, path_of(read_url) + path, json_body=body
+        )
+        assert status == 403, (method, path, status, payload)
+
+    status, raw, _ = request(
+        server.base, "GET", path_of(read_url), headers={"Accept": "text/markdown"}
+    )
+    guide = raw.decode("utf-8")
+    assert status == 200
+    assert token not in guide
+    assert created["read_token"] in guide
+    assert "read-only" in guide
+
+    status, payload, _ = api(server.base, "GET", path_of(read_url))
+    assert payload["read_only"] is True
+    assert payload["channel"]["token"] == created["read_token"]
+    assert "read_url" not in payload
+
+    status, payload, _ = api(
+        server.base,
+        "POST",
+        path_of(url) + "/artifacts?name=reader.txt&sender=alice",
+        data=b"reader artifact",
+        headers={"Content-Type": "text/plain"},
+    )
+    assert status == 201
+    artifact_id = payload["artifact"]["id"]
+    status, listing, _ = api(server.base, "GET", path_of(read_url) + "/artifacts")
+    assert status == 200
+    assert [a["id"] for a in listing["artifacts"]] == [artifact_id]
+    status, payload, _ = api(
+        server.base,
+        "POST",
+        path_of(read_url) + "/artifacts?name=nope.txt&sender=alice",
+        data=b"nope",
+        headers={"Content-Type": "text/plain"},
+    )
+    assert status == 403
+    status, payload, _ = api(
+        server.base, "DELETE", path_of(read_url) + "/artifacts/" + artifact_id
+    )
+    assert status == 403
+
+
+def test_supersedes_marks_replaced_messages_and_state_uses_current_tasks(server):
+    _, url, _ = create_channel(server)
+    old = post(server, url, sender="alice", text="old task", kind="task", state="open")
+    new = post(
+        server,
+        url,
+        sender="alice",
+        text="corrected task",
+        kind="task",
+        state="open",
+        supersedes=[old["message"]["seq"]],
+    )
+
+    page = read(server, url, since=0)
+    first = page["messages"][0]
+    assert first["superseded_by"] == new["message"]["seq"]
+    assert first["supersedes"] == []
+    assert page["messages"][1]["supersedes"] == [first["seq"]]
+
+    status, state, _ = api(server.base, "GET", path_of(url) + "/state")
+    assert status == 200
+    assert [m["seq"] for m in state["tasks"]] == [new["message"]["seq"]]
+    assert state["counts"]["tasks_open"] == 1
+
+
+def test_acknowledgements_and_unacked_state(server):
+    _, url, _ = create_channel(server)
+    join(server, url, "alice")
+    join(server, url, "bob")
+    sent = post(
+        server,
+        url,
+        sender="alice",
+        text="please run the check",
+        to="bob",
+        requires_ack=True,
+        kind="task",
+        state="open",
+    )
+    seq = sent["message"]["seq"]
+
+    status, state, _ = api(server.base, "GET", path_of(url) + "/state")
+    assert status == 200
+    assert [m["seq"] for m in state["unacked"]] == [seq]
+    assert state["unacked"][0]["sender"] == "alice"
+
+    status, payload, _ = api(
+        server.base,
+        "POST",
+        path_of(url) + "/ack",
+        json_body={"name": "bob", "seq": seq, "note": "done"},
+    )
+    assert status == 200
+    assert payload["message"]["acks"]["bob"]["note"] == "done"
+
+    status, state, _ = api(server.base, "GET", path_of(url) + "/state")
+    assert state["unacked"] == []
+    status, payload, _ = api(server.base, "GET", path_of(url) + "/messages/%d" % seq)
+    assert status == 200
+    assert set(payload["message"]["acks"]) == {"bob"}
+
+    status, payload, _ = api(
+        server.base, "POST", path_of(url) + "/ack", json_body={"name": "bob", "seq": 999}
+    )
+    assert status == 404
+
+
+def test_presence_heartbeat_and_read_cursor(server):
+    _, url, _ = create_channel(server)
+    join(server, url, "alice")
+    join(server, url, "bob")
+    post(server, url, sender="alice", text="work is running")
+    read(server, url, since=0, as_name="bob")
+
+    status, payload, _ = api(server.base, "GET", path_of(url) + "/status")
+    assert status == 200
+    bob = next(p for p in payload["participants"] if p["name"] == "bob")
+    assert bob["last_read_seq"] == 3
+    assert bob["last_read_at"] is not None
+
+    cursor_before = payload["channel"]["cursor"]
+    status, payload, _ = api(
+        server.base,
+        "POST",
+        path_of(url) + "/presence",
+        json_body={"name": "bob", "status": "seeding", "meta": {"services": ["iperf3"]}},
+    )
+    assert status == 200
+    assert payload["participant"]["status"] == "seeding"
+    assert payload["participant"]["meta"] == {"services": ["iperf3"]}
+
+    status, payload, _ = api(server.base, "GET", path_of(url) + "/status")
+    assert payload["channel"]["cursor"] == cursor_before
+    bob = next(p for p in payload["participants"] if p["name"] == "bob")
+    assert bob["status"] == "seeding"
+
+
+def test_join_meta_records_capabilities(server):
+    _, url, _ = create_channel(server)
+    status, payload, _ = api(
+        server.base,
+        "POST",
+        path_of(url) + "/join",
+        json_body={"name": "alice", "role": "rig", "meta": {"services": ["ssh", "iperf3"]}},
+    )
+    assert status == 200
+    assert payload["participant"]["meta"] == {"services": ["ssh", "iperf3"]}
+    page = read(server, url, since=0)
+    assert page["messages"][0]["data"]["meta"] == {"services": ["ssh", "iperf3"]}
+
+
+def test_thread_returns_root_and_transitive_replies(server):
+    _, url, _ = create_channel(server)
+    root = post(server, url, sender="alice", text="root")
+    reply = post(
+        server, url, sender="bob", text="reply", reply_to=root["message"]["seq"]
+    )
+    nested = post(
+        server, url, sender="alice", text="nested", reply_to=reply["message"]["seq"]
+    )
+    post(server, url, sender="bob", text="unrelated")
+
+    status, payload, _ = api(
+        server.base,
+        "GET",
+        path_of(url) + "/messages?thread=%d" % root["message"]["seq"],
+    )
+    assert status == 200
+    assert [m["seq"] for m in payload["messages"]] == [
+        root["message"]["seq"],
+        reply["message"]["seq"],
+        nested["message"]["seq"],
+    ]
+
+    status, payload, _ = api(
+        server.base, "GET", path_of(url) + "/messages/%d" % reply["message"]["seq"]
+    )
+    assert status == 200
+    assert payload["message"]["text"] == "reply"
+    status, payload, _ = api(server.base, "GET", path_of(url) + "/messages/999")
+    assert status == 404
+
+
+def test_artifacts_roundtrip_hash_state_and_delete(server):
+    _, url, _ = create_channel(server)
+    body = b"hello artifact\n"
+    status, payload, _ = api(
+        server.base,
+        "POST",
+        path_of(url) + "/artifacts?name=notes.txt&sender=alice",
+        data=body,
+        headers={"Content-Type": "text/plain"},
+    )
+    assert status == 201, payload
+    artifact = payload["artifact"]
+    assert artifact["sha256"] == hashlib.sha256(body).hexdigest()
+    assert artifact["size"] == len(body)
+    assert payload["message"]["kind"] == "artifact"
+    assert payload["message"]["data"]["id"] == artifact["id"]
+
+    status, listing, _ = api(server.base, "GET", path_of(url) + "/artifacts")
+    assert status == 200
+    assert [a["id"] for a in listing["artifacts"]] == [artifact["id"]]
+    assert listing["bytes_used"] == len(body)
+
+    status, raw, headers = request(
+        server.base, "GET", path_of(url) + "/artifacts/" + artifact["id"]
+    )
+    assert status == 200
+    assert raw == body
+    assert headers["X-Checksum-SHA256"] == artifact["sha256"]
+    assert "attachment" in headers["Content-Disposition"]
+
+    status, meta, _ = api(
+        server.base, "GET", path_of(url) + "/artifacts/%s?meta=1" % artifact["id"]
+    )
+    assert status == 200
+    assert meta["artifact"]["name"] == "notes.txt"
+
+    status, state, _ = api(server.base, "GET", path_of(url) + "/state")
+    assert [a["id"] for a in state["artifacts"]] == [artifact["id"]]
+
+    status, raw, _ = request(
+        server.base, "DELETE", path_of(url) + "/artifacts/" + artifact["id"]
+    )
+    assert status == 204
+    assert raw == b""
+    status, payload, _ = api(
+        server.base, "GET", path_of(url) + "/artifacts/" + artifact["id"]
+    )
+    assert status == 404
+
+
+def test_artifact_integrity_and_size_limits(server):
+    _, url, _ = create_channel(server)
+    status, payload, _ = api(
+        server.base,
+        "POST",
+        path_of(url) + "/artifacts?name=bad.txt&sender=alice&sha256=" + "0" * 64,
+        data=b"wrong hash",
+        headers={"Content-Type": "text/plain"},
+    )
+    assert status == 400
+    assert "sha256" in payload["error"]
+
+    status, payload, _ = api(
+        server.base,
+        "POST",
+        path_of(url) + "/artifacts?name=large.bin&sender=alice",
+        data=b"x" * (relay.MAX_ARTIFACT_BYTES + 1),
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert status == 413
+    assert "artifact" in payload["error"]
+
+
+def test_state_filters_expired_messages_and_reports_latest_status(server):
+    _, url, _ = create_channel(server)
+    post(
+        server,
+        url,
+        sender="alice",
+        text="temporary",
+        kind="alert",
+        expires_at="2000-01-01T00:00:00Z",
+    )
+    post(server, url, sender="alice", text="first status", kind="status")
+    post(server, url, sender="alice", text="latest status", kind="status")
+    post(server, url, sender="bob", text="decision", kind="decision")
+
+    status, state, _ = api(server.base, "GET", path_of(url) + "/state")
+    assert status == 200
+    assert state["alerts"] == []
+    assert [m["text"] for m in state["latest_status"]] == ["latest status"]
+    assert [m["sender"] for m in state["decisions"]] == ["bob"]
+
+    status, state, _ = api(
+        server.base, "GET", path_of(url) + "/state?include_expired=1"
+    )
+    assert [m["text"] for m in state["alerts"]] == ["temporary"]
+
+
+def test_message_metadata_validation(server):
+    _, url, _ = create_channel(server)
+    path = path_of(url) + "/messages"
+    invalid = [
+        {"priority": "low"},
+        {"tags": "vpn"},
+        {"tags": ["t%d" % i for i in range(relay.MAX_TAGS + 1)]},
+        {"supersedes": [0]},
+        {"supersedes": "one"},
+        {"requires_ack": "yes"},
+        {"expires_at": "not-a-time"},
+        {"correlation_id": "x" * (relay.MAX_CORRELATION_LEN + 1)},
+        {"kind": "x" * (relay.MAX_KIND_LEN + 1)},
+    ]
+    for extra in invalid:
+        body = {"sender": "alice", "text": "x"}
+        body.update(extra)
+        status, payload, _ = api(server.base, "POST", path, json_body=body)
+        assert status == 400, (extra, status, payload)
+
+
+def test_read_only_url_is_stable_across_restore(start_server):
+    token = "c" * 32
+    first = start_server(restore=[(token, "restored", 1)])
+    second = start_server(restore=[(token, "restored", 1)])
+    status, first_guide, _ = api(first.base, "GET", "/c/" + token)
+    assert status == 200
+    status, second_guide, _ = api(second.base, "GET", "/c/" + token)
+    assert status == 200
+    assert first_guide["read_url"].rsplit("/", 1)[-1] == second_guide["read_url"].rsplit("/", 1)[-1]
