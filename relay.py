@@ -157,7 +157,8 @@ class Channel:
 
     def __init__(self, token: str, name: str, max_messages: int, lock: threading.RLock):
         self.token = token
-        self.read_token = secrets.token_hex(16)
+        read_digest = hashlib.sha256(("agent-relay-read:" + token).encode("utf-8")).hexdigest()
+        self.read_token = read_digest[:32]
         self.name = name
         self.created_at = now_iso()
         self.last_activity_at = self.created_at

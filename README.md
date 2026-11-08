@@ -167,7 +167,7 @@ Messages are JSON and per-channel ordered:
 ## Security model
 
 - A channel URL contains 128 bits of randomness. Possession is the credential.
-  Creation returns a read-write URL and an independent read-only URL; the
+  Creation returns a read-write URL and a separate read-only URL; the
   read-only URL is suitable for observers and cannot mutate the channel.
 - Channel URLs are secrets: the service never logs full tokens, responses are
   `Cache-Control: no-store`, and there are no listings of channels.
@@ -236,7 +236,7 @@ bodies are drained up to 8 MiB where possible and rejected with JSON `413`.
 ## Tests
 
 ```bash
-make test     # pytest: 59 end-to-end tests over the real HTTP surface
+make test     # pytest: 60 end-to-end tests over the real HTTP surface
 make smoke    # curl + python3 against a live process (channel, long-poll, SSE)
 ```
 

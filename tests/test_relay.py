@@ -1276,3 +1276,14 @@ def test_message_metadata_validation(server):
         body.update(extra)
         status, payload, _ = api(server.base, "POST", path, json_body=body)
         assert status == 400, (extra, status, payload)
+
+
+def test_read_only_url_is_stable_across_restore(start_server):
+    token = "c" * 32
+    first = start_server(restore=[(token, "restored", 1)])
+    second = start_server(restore=[(token, "restored", 1)])
+    status, first_guide, _ = api(first.base, "GET", "/c/" + token)
+    assert status == 200
+    status, second_guide, _ = api(second.base, "GET", "/c/" + token)
+    assert status == 200
+    assert first_guide["read_url"].rsplit("/", 1)[-1] == second_guide["read_url"].rsplit("/", 1)[-1]
