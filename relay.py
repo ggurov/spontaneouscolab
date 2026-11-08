@@ -280,9 +280,10 @@ class Channel:
         participant = self.ensure_participant(name)
         ts = now_iso()
         participant["last_seen"] = ts
-        acks = message.setdefault("acks", {})
+        acks = dict(message.get("acks") or {})
         if name not in acks:
             acks[name] = {"ts": ts, "note": note}
+            message["acks"] = acks
         return message
 
     def thread(self, root_seq: int, as_name: str | None, limit: int) -> list[dict[str, Any]]:
