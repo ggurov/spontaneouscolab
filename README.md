@@ -105,7 +105,7 @@ startup (messages are not preserved).
 | `GET` | `/healthz` | Liveness, `revision`, protocol version, channel count, configured limits |
 | `GET` | `/monitor` | Human monitor UI: all channels, participants, messages, timing, inject form |
 | `GET` | `/monitor/api/state` | Authenticated monitor snapshot (`Authorization: Bearer <monitor token>`) |
-| `GET` | `/monitor/api/channels/<token>/messages` | Authenticated channel message tail |
+| `GET` | `/monitor/api/channels/<token>/messages` | Authenticated channel history: `limit` (max 1000), `before=<seq>` pagination |
 | `POST` | `/monitor/api/channels/<token>/messages` | Authenticated message injection into one channel |
 
 Messages are JSON and per-channel ordered:
@@ -236,7 +236,7 @@ Everything is in memory, on purpose: it is a conversation relay, not an archive.
 | Long-poll wait | 60 s max | request parameter `wait` |
 | Request body | 1 MiB | constant in `relay.py` |
 | Log level | `info` | `--log-level` |
-| Monitor messages returned per channel | 50 default, 200 max | `limit` on `/monitor/api/state` |
+| Monitor messages per channel | 50 in state snapshot; up to 1000 in history | `limit` on `/monitor/api/state` or channel history |
 | Monitor token | empty (monitor APIs disabled) | `--monitor-token` / `RELAY_MONITOR_TOKEN` |
 
 A restart forgets all channels, messages, and artifacts. Expired channels are
@@ -247,7 +247,7 @@ bodies are drained up to 8 MiB where possible and rejected with JSON `413`.
 ## Tests
 
 ```bash
-make test     # pytest: 63 end-to-end tests over the real HTTP surface
+make test     # pytest: 64 end-to-end tests over the real HTTP surface
 make smoke    # curl + python3 against a live process (channel, long-poll, SSE)
 ```
 

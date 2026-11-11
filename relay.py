@@ -54,6 +54,7 @@ MAX_ARTIFACTS_PER_CHANNEL = 32
 MAX_ARTIFACT_TOTAL_BYTES = 2 * 1024 * 1024
 MAX_STATE_ITEMS = 50
 MAX_MONITOR_MESSAGES = 200
+MAX_MONITOR_HISTORY = 1000
 DEFAULT_MONITOR_MESSAGES = 50
 MAX_THREAD_ITEMS = 1000
 MAX_WAIT = 60.0
@@ -208,6 +209,14 @@ class Channel:
     def tail(self, as_name: str | None, limit: int) -> list[dict[str, Any]]:
         """Newest visible messages, oldest first."""
         visible = [message for message in self.messages if self._visible(message, as_name)]
+        return visible[-limit:]
+
+    def history(self, before: int | None, limit: int) -> list[dict[str, Any]]:
+        """Retained messages before a seq, oldest first."""
+        if before is None:
+            visible = list(self.messages)
+        else:
+            visible = [message for message in self.messages if message["seq"] < before]
         return visible[-limit:]
 
     def info(self, ttl_seconds: float) -> dict[str, Any]:
@@ -861,15 +870,31 @@ class Relay:
                 "channels": rows,
             }
 
-    def monitor_messages(self, token: str, limit: int = DEFAULT_MONITOR_MESSAGES) -> dict[str, Any]:
-        limit = max(1, min(int(limit), MAX_MONITOR_MESSAGES))
+    def monitor_messages(
+        self,
+        token: str,
+        limit: int = DEFAULT_MONITOR_MESSAGES,
+        before: int | None = None,
+    ) -> dict[str, Any]:
+        limit = max(1, min(int(limit), MAX_MONITOR_HISTORY))
         with self.lock:
             channel = self.channels.get(token)
             if channel is None or channel.closed:
                 raise ApiError(404, "unknown channel")
+            messages = copy.deepcopy(channel.history(before, limit))
+            oldest = channel.oldest_seq()
+            latest = channel.latest_seq()
+            has_more = bool(
+                messages and oldest is not None and messages[0]["seq"] > oldest
+            )
             return {
                 "channel": channel.info(self.ttl_seconds),
-                "messages": copy.deepcopy(channel.tail(None, limit)),
+                "messages": messages,
+                "oldest_seq": oldest,
+                "latest_seq": latest,
+                "has_more": has_more,
+                "next_before": messages[0]["seq"] - 1 if has_more else None,
+                "before": before,
                 "server_time": now_iso(),
             }
 
@@ -957,10 +982,11 @@ The optional `name` is for humans; if omitted, the channel is named
 
 When the service runs with `--monitor-token` (or `RELAY_MONITOR_TOKEN`), open
 `%(base)s/monitor` for a human view of all channels, participants, retained
-messages, timing, waiters, and artifacts. The page asks for the monitor token;
-API calls require `Authorization: Bearer <token>`. The monitor can inject a
-message into any channel. Treat the token as an administrator credential; the
-page itself is public but contains no channel data until authenticated.
+messages, paginated history, timing, waiters, and artifacts. The page asks for
+the monitor token; API calls require `Authorization: Bearer <token>`. History is
+`GET <base>/monitor/api/channels/<token>/messages?limit=200&before=<seq>`.
+The monitor can inject a message into any channel. Treat the token as an
+administrator credential; the page itself is public but contains no channel data until authenticated.
 
 ## Limits and semantics
 
@@ -997,6 +1023,7 @@ SERVICE_GUIDE_JSON = {
         "path": "/monitor",
         "auth": "Authorization: Bearer <RELAY_MONITOR_TOKEN>",
         "read": "GET /monitor/api/state?limit=50",
+        "history": "GET /monitor/api/channels/<token>/messages?limit=200&before=<seq>",
         "inject": "POST /monitor/api/channels/<token>/messages",
     },
     "channel_protocol": {
@@ -1512,7 +1539,10 @@ code, .mono { font-family: inherit; }
             <thead><tr><th>name</th><th>role</th><th>status</th><th>msgs</th><th>last seen</th><th>read seq</th></tr></thead>
             <tbody id="participants"></tbody>
           </table></div>
-          <h3>Messages <span class="muted" id="message-count"></span></h3>
+          <div class="row" style="justify-content:space-between">
+            <h3 style="margin:0">Messages <span class="muted" id="message-count"></span></h3>
+            <button id="load-older" class="hidden">Load older</button>
+          </div>
           <div class="scroll"><table>
             <thead><tr><th>seq</th><th>time</th><th>sender</th><th>kind</th><th>to</th><th>text / data</th></tr></thead>
             <tbody id="messages"></tbody>
@@ -1577,6 +1607,9 @@ code, .mono { font-family: inherit; }
   let current = null;
   let latest = null;
   let loading = false;
+  let history = [];
+  let historyToken = null;
+  let historyHasMore = false;
 
   const setStatus = (id, text, error) => {
     const el = $(id);
@@ -1619,6 +1652,9 @@ code, .mono { font-family: inherit; }
     token = '';
     current = null;
     latest = null;
+    history = [];
+    historyToken = null;
+    historyHasMore = false;
     sessionStorage.removeItem('relayMonitorToken');
     showLogin(message || '');
   }
@@ -1663,23 +1699,67 @@ code, .mono { font-family: inherit; }
     const channel = current ? channelByToken(current) : null;
     if (!channel) {
       $('detail').classList.add('hidden');
+      history = [];
+      historyToken = null;
+      historyHasMore = false;
       return;
+    }
+    if (historyToken !== channel.token) {
+      historyToken = channel.token;
+      history = channel.messages.slice();
+      historyHasMore = Boolean(
+        history.length && channel.oldest_seq != null && history[0].seq > channel.oldest_seq
+      );
+    } else {
+      const known = new Set(history.map((message) => message.seq));
+      let changed = false;
+      channel.messages.forEach((message) => {
+        if (!known.has(message.seq)) {
+          history.push(message);
+          changed = true;
+        }
+      });
+      if (changed) history.sort((a, b) => a.seq - b.seq);
     }
     $('detail').classList.remove('hidden');
     $('detail-name').textContent = channel.name;
     $('detail-token').textContent = channel.token;
-    $('message-count').textContent = '(' + channel.retained + ' retained, cursor ' + channel.cursor + ')';
+    $('message-count').textContent = '(' + history.length + ' loaded / ' +
+      channel.retained + ' retained, cursor ' + channel.cursor + ')';
     $('participants').innerHTML = channel.participants.map((p) =>
       '<tr><td>' + esc(p.name) + '</td><td>' + esc(p.role || '-') + '</td>' +
       '<td>' + esc(p.status || '-') + '</td><td>' + p.messages + '</td>' +
       '<td>' + esc(fmtTime(p.last_seen)) + '</td><td>' + (p.last_read_seq == null ? '-' : p.last_read_seq) + '</td></tr>'
     ).join('') || '<tr><td colspan="6" class="muted">No participants.</td></tr>';
-    $('messages').innerHTML = channel.messages.slice().reverse().map((m) =>
+    $('load-older').classList.toggle('hidden', !historyHasMore);
+    $('messages').innerHTML = history.slice().reverse().map((m) =>
       '<tr><td>' + m.seq + '</td><td>' + esc(fmtTime(m.ts)) + '</td><td>' + esc(m.sender) + '</td>' +
       '<td>' + esc(m.kind) + (m.state ? ' · ' + esc(m.state) : '') + '</td>' +
       '<td>' + esc(m.to || '-') + '</td><td><pre class="msg">' + esc(m.text || '') +
       (m.data == null ? '' : '\\n' + esc(JSON.stringify(m.data))) + '</pre></td></tr>'
     ).join('') || '<tr><td colspan="6" class="muted">No retained messages.</td></tr>';
+  }
+
+  async function loadOlder() {
+    if (!current || !history.length) return;
+    const button = $('load-older');
+    button.disabled = true;
+    button.textContent = 'Loading…';
+    try {
+      const data = await api('/channels/' + encodeURIComponent(current) +
+        '/messages?limit=200&before=' + history[0].seq);
+      const known = new Set(history.map((message) => message.seq));
+      const older = data.messages.filter((message) => !known.has(message.seq));
+      history = older.concat(history);
+      history.sort((a, b) => a.seq - b.seq);
+      historyHasMore = Boolean(data.has_more);
+      renderDetail();
+    } catch (error) {
+      setStatus('state-status', String(error), true);
+    } finally {
+      button.disabled = false;
+      button.textContent = 'Load older';
+    }
   }
 
   function render() {
@@ -1715,11 +1795,25 @@ code, .mono { font-family: inherit; }
   });
   $('disconnect').addEventListener('click', () => logout('Disconnected.'));
   $('refresh').addEventListener('click', load);
-  $('close-detail').addEventListener('click', () => { current = null; renderDetail(); renderChannels(); });
+  $('load-older').addEventListener('click', loadOlder);
+  $('close-detail').addEventListener('click', () => {
+    current = null;
+    history = [];
+    historyToken = null;
+    historyHasMore = false;
+    renderDetail();
+    renderChannels();
+  });
   $('channels').addEventListener('click', (event) => {
     const row = event.target.closest('tr[data-token]');
     if (!row) return;
-    current = row.getAttribute('data-token');
+    const next = row.getAttribute('data-token');
+    if (next !== current) {
+      history = [];
+      historyToken = null;
+      historyHasMore = false;
+    }
+    current = next;
     renderChannels();
     renderDetail();
   });
@@ -2079,9 +2173,16 @@ class RelayHandler(BaseHTTPRequestHandler):
         ):
             limit = min(
                 self._int_query(query, "limit", DEFAULT_MONITOR_MESSAGES, 1),
-                MAX_MONITOR_MESSAGES,
+                MAX_MONITOR_HISTORY,
             )
-            self._send_json(200, self.relay.monitor_messages(parts[3], limit))
+            before_raw = (query.get("before") or [None])[0]
+            before = None
+            if before_raw not in (None, ""):
+                before = self._int_query(query, "before", 0, 1)
+            self._send_json(
+                200,
+                self.relay.monitor_messages(parts[3], limit, before=before),
+            )
             return
         raise ApiError(404, "unknown endpoint")
 

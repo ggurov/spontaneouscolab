@@ -1379,3 +1379,42 @@ def test_monitor_injects_messages(start_server):
         headers=auth,
     )
     assert status == 404
+
+
+def test_monitor_history_pagination(start_server):
+    server = start_server(monitor_token="monitor-secret")
+    token, _, _ = create_channel(server, "history")
+    auth = {"Authorization": "Bearer monitor-secret"}
+    for index in range(5):
+        post(server, server.base + "/c/" + token, text="m%d" % index)
+
+    status, payload, _ = api(
+        server.base,
+        "GET",
+        "/monitor/api/channels/%s/messages?limit=2" % token,
+        headers=auth,
+    )
+    assert status == 200
+    assert [m["seq"] for m in payload["messages"]] == [4, 5]
+    assert payload["has_more"] is True
+    assert payload["next_before"] == 3
+
+    status, payload, _ = api(
+        server.base,
+        "GET",
+        "/monitor/api/channels/%s/messages?limit=2&before=4" % token,
+        headers=auth,
+    )
+    assert status == 200
+    assert [m["seq"] for m in payload["messages"]] == [2, 3]
+    assert payload["has_more"] is True
+
+    status, payload, _ = api(
+        server.base,
+        "GET",
+        "/monitor/api/channels/%s/messages?limit=2&before=2" % token,
+        headers=auth,
+    )
+    assert status == 200
+    assert [m["seq"] for m in payload["messages"]] == [1]
+    assert payload["has_more"] is False
