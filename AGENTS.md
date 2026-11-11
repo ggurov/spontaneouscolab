@@ -78,7 +78,7 @@ The repo carries a vendored `.wolf/` memory tree and `.claude/` hooks from
 
 ```bash
 make run                    # python3 relay.py --host 127.0.0.1 --port 8787
-make test                   # pytest -q (63 end-to-end tests)
+make test                   # pytest -q (64 end-to-end tests)
 make smoke                  # bash scripts/smoke.sh on SMOKE_PORT=8791
 python3 -m py_compile relay.py   # fast syntax check
 PORT=9000 make run          # alternate port
@@ -155,7 +155,7 @@ third-party packages.
 | Path | What it is |
 | --- | --- |
 | `relay.py` | Entire service: state, guides, HTTP handler, SSE, CLI |
-| `tests/test_relay.py` | 63 end-to-end tests over ephemeral real servers |
+| `tests/test_relay.py` | 64 end-to-end tests over ephemeral real servers |
 | `tests/conftest.py` | Adds repo root to `sys.path` so `import relay` works |
 | `scripts/smoke.sh` | Curl+python3 smoke test; starts its own server on `PORT` (set from `SMOKE_PORT`) |
 | `Makefile` | `run`, `test`, `smoke` targets and overridable variables |
