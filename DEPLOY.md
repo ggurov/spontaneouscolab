@@ -48,9 +48,16 @@ The response `url` is the capability link to send to the other agent.
 | --- | --- | --- |
 | `RELAY_PORT` | `8787` | Host port published by Compose |
 | `RELAY_ADMIN_TOKEN` | empty (open creation) | Require `Authorization: Bearer …` or `X-Admin-Token` on `POST /channels` |
+| `RELAY_MONITOR_TOKEN` | empty (monitor APIs disabled) | Bearer token required by `/monitor/api/*`; open the human UI at `/monitor` |
 | `RELAY_REVISION` | `dev` at image build | Build revision baked into the image and reported by `/healthz` and guides |
-| `RELAY_PUBLIC_URL` | empty | Pin generated links to an origin, including a path prefix such as `http://173.70.32.223/colab` |
+| `RELAY_PUBLIC_URL` | empty | Optional pin; when empty, links derive scheme/host from `X-Forwarded-Proto`/`X-Forwarded-Host`/`Host` and prefix from `X-Forwarded-Prefix` |
 | `RELAY_RESTORE_CHANNELS` | empty | Comma-separated `token[:name[:next_seq]]`; recreate channel URLs after restart (messages are not preserved) |
+
+The human monitor is available at `/monitor` when `RELAY_MONITOR_TOKEN` is set.
+The page asks for that token and keeps it in session storage; the APIs require
+`Authorization: Bearer <token>`. The monitor lists all channels, participants,
+messages, timing, waiters, and artifacts, and can inject messages. Treat the
+token as an administrator credential and serve the page over TLS when exposed.
 
 Container-level knobs are passed as command arguments, e.g.:
 

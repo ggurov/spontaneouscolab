@@ -11,6 +11,7 @@ Zero third-party dependencies; Python 3.9+ standard library only.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import hmac
 import json
@@ -52,6 +53,8 @@ MAX_ARTIFACT_BYTES = 128 * 1024
 MAX_ARTIFACTS_PER_CHANNEL = 32
 MAX_ARTIFACT_TOTAL_BYTES = 2 * 1024 * 1024
 MAX_STATE_ITEMS = 50
+MAX_MONITOR_MESSAGES = 200
+DEFAULT_MONITOR_MESSAGES = 50
 MAX_THREAD_ITEMS = 1000
 MAX_WAIT = 60.0
 DEFAULT_LIMIT = 100
@@ -161,6 +164,7 @@ class Channel:
         self.read_token = read_digest[:32]
         self.name = name
         self.created_at = now_iso()
+        self.created_mono = time.monotonic()
         self.last_activity_at = self.created_at
         self.next_seq = 1
         self.messages: deque[dict[str, Any]] = deque(maxlen=max_messages)
@@ -208,13 +212,18 @@ class Channel:
 
     def info(self, ttl_seconds: float) -> dict[str, Any]:
         oldest = self.oldest_seq()
+        now = time.monotonic()
+        idle_s = max(0.0, now - self._last_seen_mono)
         expires_in = None
         if ttl_seconds > 0:
-            expires_in = max(0, int(ttl_seconds - (time.monotonic() - self._last_seen_mono)))
+            expires_in = max(0, int(ttl_seconds - idle_s))
         return {
             "name": self.name,
             "created_at": self.created_at,
             "last_activity_at": self.last_activity_at,
+            "age_s": round(max(0.0, now - self.created_mono), 1),
+            "idle_s": round(idle_s, 1),
+            "expires_in_s": expires_in,
             "cursor": self.latest_seq(),
             "retained": len(self.messages),
             "oldest_seq": oldest,
@@ -381,6 +390,7 @@ class Relay:
         max_channels: int = DEFAULT_MAX_CHANNELS,
         base_url: str | None = None,
         admin_token: str | None = None,
+        monitor_token: str | None = None,
         revision: str | None = None,
         restore: Iterable[tuple[str, str, int]] | None = None,
     ):
@@ -392,6 +402,7 @@ class Relay:
         self.max_channels = max(1, int(max_channels))
         self.base_url = (base_url or "").rstrip("/") or None
         self.admin_token = admin_token or None
+        self.monitor_token = monitor_token or None
         self.revision = (revision or os.environ.get("RELAY_REVISION") or "dev").strip() or "dev"
         self.started_mono = time.monotonic()
         self.stopping = False
@@ -625,6 +636,7 @@ class Relay:
                 "ok": True,
                 "revision": self.revision,
                 "protocol_version": PROTOCOL_VERSION,
+                "monitor_enabled": bool(self.monitor_token),
                 "channels": len(self.channels),
                 "uptime_s": round(time.monotonic() - self.started_mono, 1),
                 "limits": {
@@ -798,6 +810,69 @@ class Relay:
                 raise ApiError(404, "artifact not found")
             channel.artifact_bytes = max(0, channel.artifact_bytes - artifact["size"])
 
+    def check_monitor(self, provided: str | None) -> None:
+        if not self.monitor_token:
+            raise ApiError(
+                403,
+                "monitor is disabled; set --monitor-token or RELAY_MONITOR_TOKEN",
+            )
+        if not provided or not hmac.compare_digest(provided, self.monitor_token):
+            raise ApiError(401, "monitor token required")
+
+    def monitor_snapshot(self, limit: int = DEFAULT_MONITOR_MESSAGES) -> dict[str, Any]:
+        limit = max(1, min(int(limit), MAX_MONITOR_MESSAGES))
+        with self.lock:
+            rows: list[dict[str, Any]] = []
+            for channel in sorted(
+                self.channels.values(),
+                key=lambda item: item.last_activity_at,
+                reverse=True,
+            ):
+                info = channel.info(self.ttl_seconds)
+                artifacts = [
+                    {key: value for key, value in artifact.items() if key != "_body"}
+                    for artifact in channel.artifacts.values()
+                ]
+                rows.append({
+                    "token": channel.token,
+                    **info,
+                    "participants": copy.deepcopy(channel.participant_list()),
+                    "messages": copy.deepcopy(channel.tail(None, limit)),
+                    "artifacts": artifacts,
+                    "artifact_bytes": channel.artifact_bytes,
+                })
+            totals = {
+                "channels": len(rows),
+                "participants": sum(len(row["participants"]) for row in rows),
+                "retained_messages": sum(row["retained"] for row in rows),
+                "messages_posted": sum(row["cursor"] for row in rows),
+                "waiters": sum(row["waiters"] for row in rows),
+                "artifacts": sum(len(row["artifacts"]) for row in rows),
+                "artifact_bytes": sum(row["artifact_bytes"] for row in rows),
+            }
+            return {
+                "service": "agent-relay",
+                "revision": self.revision,
+                "protocol_version": PROTOCOL_VERSION,
+                "server_time": now_iso(),
+                "uptime_s": round(time.monotonic() - self.started_mono, 1),
+                "message_limit": limit,
+                "totals": totals,
+                "channels": rows,
+            }
+
+    def monitor_messages(self, token: str, limit: int = DEFAULT_MONITOR_MESSAGES) -> dict[str, Any]:
+        limit = max(1, min(int(limit), MAX_MONITOR_MESSAGES))
+        with self.lock:
+            channel = self.channels.get(token)
+            if channel is None or channel.closed:
+                raise ApiError(404, "unknown channel")
+            return {
+                "channel": channel.info(self.ttl_seconds),
+                "messages": copy.deepcopy(channel.tail(None, limit)),
+                "server_time": now_iso(),
+            }
+
     def shutdown(self) -> None:
         """Wake parked long-polls/SSE so they can report a retryable 503."""
         with self.lock:
@@ -878,6 +953,15 @@ The optional `name` is for humans; if omitted, the channel is named
   them and the server keeps them in memory; encrypt client-side or use an
   out-of-band secret channel.
 
+## Operator monitor
+
+When the service runs with `--monitor-token` (or `RELAY_MONITOR_TOKEN`), open
+`%(base)s/monitor` for a human view of all channels, participants, retained
+messages, timing, waiters, and artifacts. The page asks for the monitor token;
+API calls require `Authorization: Bearer <token>`. The monitor can inject a
+message into any channel. Treat the token as an administrator credential; the
+page itself is public but contains no channel data until authenticated.
+
 ## Limits and semantics
 
 - Messages are per-channel, ordered by a monotonic `seq`; delivery is
@@ -908,6 +992,12 @@ SERVICE_GUIDE_JSON = {
             "read_token": "<32 hex chars>",
             "read_url": "<base>/c/<read_token>",
         },
+    },
+    "monitor": {
+        "path": "/monitor",
+        "auth": "Authorization: Bearer <RELAY_MONITOR_TOKEN>",
+        "read": "GET /monitor/api/state?limit=50",
+        "inject": "POST /monitor/api/channels/<token>/messages",
     },
     "channel_protocol": {
         "transport": "HTTP/1.1, JSON bodies",
@@ -1259,6 +1349,421 @@ def channel_guide_json(
         payload["read_url"] = read_url
     return payload
 
+MONITOR_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Relay monitor</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #0b0f14;
+  --panel: #111821;
+  --panel2: #16212d;
+  --border: #263444;
+  --text: #d7e0ea;
+  --muted: #8fa1b3;
+  --accent: #59b8ff;
+  --good: #4dd18b;
+  --warn: #f0b85b;
+  --bad: #ff6b6b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+header {
+  display: flex;
+  gap: 18px;
+  align-items: baseline;
+  padding: 18px 24px;
+  border-bottom: 1px solid var(--border);
+  background: #0d131a;
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+h1 { font-size: 17px; margin: 0; letter-spacing: .04em; }
+h2 { font-size: 14px; margin: 0 0 10px; color: var(--accent); }
+h3 { font-size: 13px; margin: 18px 0 8px; color: var(--muted); }
+.sub { color: var(--muted); font-size: 12px; }
+.spacer { flex: 1; }
+main { padding: 20px 24px 60px; max-width: 1500px; margin: 0 auto; }
+.hidden { display: none !important; }
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  margin-bottom: 16px;
+}
+.login { max-width: 560px; margin: 40px auto; }
+label { display: block; color: var(--muted); font-size: 12px; margin: 8px 0 4px; }
+input, select, textarea, button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 7px 9px;
+}
+input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); }
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: #173a57; border-color: #2a6b9f; }
+button.danger { color: var(--bad); }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.stat { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.stat .n { font-size: 22px; color: var(--accent); }
+.stat .l { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; font-weight: 500; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: #15202b; }
+tbody tr.selected { background: #173247; }
+code, .mono { font-family: inherit; }
+.muted { color: var(--muted); }
+.good { color: var(--good); }
+.warn { color: var(--warn); }
+.bad { color: var(--bad); }
+.badge { display: inline-block; border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; font-size: 11px; color: var(--muted); }
+.msg { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; max-height: 260px; overflow: auto; }
+.detail-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(320px, .75fr); gap: 16px; }
+@media (max-width: 900px) { .detail-grid { grid-template-columns: 1fr; } }
+.inject { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; }
+.inject .wide { grid-column: 1 / -1; }
+.inject textarea { width: 100%; min-height: 76px; resize: vertical; }
+.status { min-height: 20px; color: var(--muted); font-size: 12px; }
+.error { color: var(--bad); }
+.token { color: var(--muted); font-size: 11px; }
+.scroll { max-height: 520px; overflow: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Agent Relay monitor</h1>
+  <span class="sub" id="build"></span>
+  <span class="spacer"></span>
+  <label class="row" style="margin:0;color:var(--muted)">
+    <input type="checkbox" id="auto" checked> auto-refresh
+  </label>
+  <button id="refresh">Refresh</button>
+  <button id="disconnect" class="danger hidden">Disconnect</button>
+</header>
+<main>
+  <section class="panel login" id="login">
+    <h2>Monitor access</h2>
+    <p class="muted">Enter the relay monitor token. It is sent only as a bearer header and kept in this browser tab's session storage.</p>
+    <form id="login-form">
+      <label for="token">Monitor token</label>
+      <div class="row">
+        <input id="token" type="password" autocomplete="current-password" style="flex:1" required>
+        <button class="primary" type="submit">Connect</button>
+      </div>
+    </form>
+    <div class="status" id="login-status"></div>
+  </section>
+
+  <div id="dashboard" class="hidden">
+    <section class="stats">
+      <div class="stat"><div class="n" id="stat-channels">-</div><div class="l">channels</div></div>
+      <div class="stat"><div class="n" id="stat-participants">-</div><div class="l">participants</div></div>
+      <div class="stat"><div class="n" id="stat-retained">-</div><div class="l">retained msgs</div></div>
+      <div class="stat"><div class="n" id="stat-posted">-</div><div class="l">messages posted</div></div>
+      <div class="stat"><div class="n" id="stat-waiters">-</div><div class="l">waiters</div></div>
+      <div class="stat"><div class="n" id="stat-uptime">-</div><div class="l">uptime</div></div>
+      <div class="stat"><div class="n" id="stat-artifacts">-</div><div class="l">artifacts</div></div>
+    </section>
+
+    <section class="panel">
+      <div class="row" style="justify-content:space-between">
+        <div><h2 style="margin:0">Channels</h2><span class="sub" id="updated"></span></div>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead><tr>
+            <th>name</th><th>token</th><th>participants</th><th>cursor</th>
+            <th>retained</th><th>waiters</th><th>idle</th><th>expires</th><th>last activity</th>
+          </tr></thead>
+          <tbody id="channels"></tbody>
+        </table>
+      </div>
+      <div class="status error" id="state-status"></div>
+    </section>
+
+    <section class="panel hidden" id="detail">
+      <div class="row" style="justify-content:space-between;margin-bottom:8px">
+        <div>
+          <h2 id="detail-name" style="margin:0"></h2>
+          <div class="token" id="detail-token"></div>
+        </div>
+        <button id="close-detail">Close</button>
+      </div>
+      <div class="detail-grid">
+        <div>
+          <h3>Participants</h3>
+          <div class="scroll"><table>
+            <thead><tr><th>name</th><th>role</th><th>status</th><th>msgs</th><th>last seen</th><th>read seq</th></tr></thead>
+            <tbody id="participants"></tbody>
+          </table></div>
+          <h3>Messages <span class="muted" id="message-count"></span></h3>
+          <div class="scroll"><table>
+            <thead><tr><th>seq</th><th>time</th><th>sender</th><th>kind</th><th>to</th><th>text / data</th></tr></thead>
+            <tbody id="messages"></tbody>
+          </table></div>
+        </div>
+        <div>
+          <h3>Inject a message</h3>
+          <form class="inject" id="inject-form">
+            <div><label for="inj-sender">sender</label><input id="inj-sender" value="monitor" required></div>
+            <div><label for="inj-to">to (optional)</label><input id="inj-to"></div>
+            <div><label for="inj-reply">reply_to (seq)</label><input id="inj-reply" type="number" min="1"></div>
+            <div><label for="inj-kind">kind</label><select id="inj-kind">
+              <option>message</option><option>task</option><option>status</option>
+              <option>decision</option><option>alert</option><option>metric</option>
+            </select></div>
+            <div><label for="inj-state">state</label><select id="inj-state">
+              <option value="">(none)</option><option>open</option><option>blocked</option>
+              <option>done</option><option>cancelled</option><option>idle</option>
+            </select></div>
+            <div><label for="inj-priority">priority</label><select id="inj-priority">
+              <option>normal</option><option>high</option><option>urgent</option>
+            </select></div>
+            <div class="wide"><label for="inj-text">text</label><textarea id="inj-text" required></textarea></div>
+            <div class="wide"><label for="inj-data">data JSON (optional)</label><textarea id="inj-data" placeholder='{"key":"value"}'></textarea></div>
+            <div class="wide row">
+              <label class="row" style="margin:0"><input type="checkbox" id="inj-ack"> requires ack</label>
+              <button class="primary" type="submit">Inject</button>
+              <span class="status" id="inject-status"></span>
+            </div>
+          </form>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+<script>
+(() => {
+  const API = location.pathname.replace(/\\/+$/, '') + '/api';
+  const $ = (id) => document.getElementById(id);
+  const esc = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+  const fmtTime = (value) => {
+    if (!value) return '-';
+    const d = new Date(value);
+    return isNaN(d.getTime()) ? value : d.toLocaleString();
+  };
+  const fmtDur = (seconds) => {
+    if (seconds == null) return 'never';
+    seconds = Math.max(0, Math.floor(Number(seconds) || 0));
+    const d = Math.floor(seconds / 86400);
+    const h = Math.floor((seconds % 86400) / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    if (d) return d + 'd ' + h + 'h';
+    if (h) return h + 'h ' + m + 'm';
+    if (m) return m + 'm ' + s + 's';
+    return s + 's';
+  };
+  const short = (token) => token ? token.slice(0, 8) + '…' : '-';
+  let token = sessionStorage.getItem('relayMonitorToken') || '';
+  let current = null;
+  let latest = null;
+  let loading = false;
+
+  const setStatus = (id, text, error) => {
+    const el = $(id);
+    if (!el) return;
+    el.textContent = text || '';
+    el.className = 'status' + (error ? ' error' : '');
+  };
+
+  const authHeaders = () => token ? { Authorization: 'Bearer ' + token } : {};
+
+  async function api(path, options = {}) {
+    const headers = Object.assign({}, options.headers || {}, authHeaders());
+    const response = await fetch(API + path, Object.assign({}, options, { headers }));
+    if (response.status === 401) {
+      logout('Monitor token rejected.');
+      throw new Error('unauthorized');
+    }
+    if (!response.ok) {
+      let detail = '';
+      try { detail = await response.text(); } catch (_) {}
+      throw new Error('HTTP ' + response.status + ' ' + detail);
+    }
+    return response.json();
+  }
+
+  function showLogin(message) {
+    $('dashboard').classList.add('hidden');
+    $('login').classList.remove('hidden');
+    $('disconnect').classList.add('hidden');
+    setStatus('login-status', message || '');
+  }
+
+  function showDashboard() {
+    $('login').classList.add('hidden');
+    $('dashboard').classList.remove('hidden');
+    $('disconnect').classList.remove('hidden');
+  }
+
+  function logout(message) {
+    token = '';
+    current = null;
+    latest = null;
+    sessionStorage.removeItem('relayMonitorToken');
+    showLogin(message || '');
+  }
+
+  function channelByToken(value) {
+    return latest && latest.channels.find((channel) => channel.token === value);
+  }
+
+  function renderStats() {
+    const totals = latest.totals || {};
+    $('stat-channels').textContent = totals.channels ?? '-';
+    $('stat-participants').textContent = totals.participants ?? '-';
+    $('stat-retained').textContent = totals.retained_messages ?? '-';
+    $('stat-posted').textContent = totals.messages_posted ?? '-';
+    $('stat-waiters').textContent = totals.waiters ?? '-';
+    $('stat-uptime').textContent = fmtDur(latest.uptime_s);
+    $('stat-artifacts').textContent = totals.artifacts ?? '-';
+    $('build').textContent = 'rev ' + (latest.revision || '?') + ' · protocol ' + (latest.protocol_version || '?');
+    $('updated').textContent = 'updated ' + fmtTime(latest.server_time);
+  }
+
+  function renderChannels() {
+    const body = $('channels');
+    body.innerHTML = latest.channels.map((channel) => {
+      const selected = channel.token === current ? ' class="selected"' : '';
+      return '<tr data-token="' + esc(channel.token) + '"' + selected + '>' +
+        '<td>' + esc(channel.name) + '</td>' +
+        '<td class="muted">' + esc(short(channel.token)) + '</td>' +
+        '<td>' + channel.participants.length + '</td>' +
+        '<td>' + channel.cursor + '</td>' +
+        '<td>' + channel.retained + '</td>' +
+        '<td>' + channel.waiters + '</td>' +
+        '<td>' + fmtDur(channel.idle_s) + '</td>' +
+        '<td>' + fmtDur(channel.expires_in_s) + '</td>' +
+        '<td>' + esc(fmtTime(channel.last_activity_at)) + '</td>' +
+        '</tr>';
+    }).join('');
+    if (!latest.channels.length) body.innerHTML = '<tr><td colspan="9" class="muted">No channels.</td></tr>';
+  }
+
+  function renderDetail() {
+    const channel = current ? channelByToken(current) : null;
+    if (!channel) {
+      $('detail').classList.add('hidden');
+      return;
+    }
+    $('detail').classList.remove('hidden');
+    $('detail-name').textContent = channel.name;
+    $('detail-token').textContent = channel.token;
+    $('message-count').textContent = '(' + channel.retained + ' retained, cursor ' + channel.cursor + ')';
+    $('participants').innerHTML = channel.participants.map((p) =>
+      '<tr><td>' + esc(p.name) + '</td><td>' + esc(p.role || '-') + '</td>' +
+      '<td>' + esc(p.status || '-') + '</td><td>' + p.messages + '</td>' +
+      '<td>' + esc(fmtTime(p.last_seen)) + '</td><td>' + (p.last_read_seq == null ? '-' : p.last_read_seq) + '</td></tr>'
+    ).join('') || '<tr><td colspan="6" class="muted">No participants.</td></tr>';
+    $('messages').innerHTML = channel.messages.slice().reverse().map((m) =>
+      '<tr><td>' + m.seq + '</td><td>' + esc(fmtTime(m.ts)) + '</td><td>' + esc(m.sender) + '</td>' +
+      '<td>' + esc(m.kind) + (m.state ? ' · ' + esc(m.state) : '') + '</td>' +
+      '<td>' + esc(m.to || '-') + '</td><td><pre class="msg">' + esc(m.text || '') +
+      (m.data == null ? '' : '\\n' + esc(JSON.stringify(m.data))) + '</pre></td></tr>'
+    ).join('') || '<tr><td colspan="6" class="muted">No retained messages.</td></tr>';
+  }
+
+  function render() {
+    if (!latest) return;
+    renderStats();
+    renderChannels();
+    renderDetail();
+  }
+
+  async function load() {
+    if (!token || loading) return;
+    loading = true;
+    try {
+      latest = await api('/state?limit=50');
+      showDashboard();
+      render();
+      setStatus('state-status', '');
+    } catch (error) {
+      if (String(error.message).startsWith('HTTP 403')) showLogin(String(error));
+      else if (String(error.message) !== 'unauthorized') setStatus('state-status', String(error), true);
+    } finally {
+      loading = false;
+    }
+  }
+
+  $('login-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    token = $('token').value.trim();
+    if (!token) return;
+    sessionStorage.setItem('relayMonitorToken', token);
+    $('token').value = '';
+    load();
+  });
+  $('disconnect').addEventListener('click', () => logout('Disconnected.'));
+  $('refresh').addEventListener('click', load);
+  $('close-detail').addEventListener('click', () => { current = null; renderDetail(); renderChannels(); });
+  $('channels').addEventListener('click', (event) => {
+    const row = event.target.closest('tr[data-token]');
+    if (!row) return;
+    current = row.getAttribute('data-token');
+    renderChannels();
+    renderDetail();
+  });
+  $('inject-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!current) return;
+    const rawData = $('inj-data').value.trim();
+    let data = null;
+    if (rawData) {
+      try { data = JSON.parse(rawData); }
+      catch (_) { setStatus('inject-status', 'data must be valid JSON', true); return; }
+    }
+    const body = {
+      sender: $('inj-sender').value,
+      text: $('inj-text').value,
+      kind: $('inj-kind').value,
+      priority: $('inj-priority').value,
+      requires_ack: $('inj-ack').checked
+    };
+    if ($('inj-to').value.trim()) body.to = $('inj-to').value.trim();
+    if ($('inj-reply').value) body.reply_to = Number($('inj-reply').value);
+    if ($('inj-state').value) body.state = $('inj-state').value;
+    if (data !== null) body.data = data;
+    setStatus('inject-status', 'injecting…');
+    try {
+      const result = await api('/channels/' + encodeURIComponent(current) + '/messages', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      });
+      setStatus('inject-status', 'injected seq ' + result.message.seq);
+      $('inj-text').value = '';
+      $('inj-data').value = '';
+      await load();
+    } catch (error) {
+      setStatus('inject-status', String(error), true);
+    }
+  });
+  setInterval(() => { if ($('auto').checked && !document.hidden) load(); }, 2000);
+  if (token) load(); else showLogin('');
+})();
+</script>
+</body>
+</html>
+"""
+
 
 # ---------------------------------------------------------------------------
 # HTTP layer
@@ -1320,6 +1825,16 @@ class RelayHandler(BaseHTTPRequestHandler):
                 methods = ["GET", "HEAD", "POST"]
             elif len(rest) == 2 and rest[0] == "artifacts":
                 methods = ["GET", "HEAD", "DELETE"]
+        elif parts == ["monitor"]:
+            methods = ["GET", "HEAD"]
+        elif parts[:3] == ["monitor", "api", "state"] and len(parts) == 3:
+            methods = ["GET", "HEAD"]
+        elif (
+            len(parts) == 5
+            and parts[:3] == ["monitor", "api", "channels"]
+            and parts[4] == "messages"
+        ):
+            methods = ["GET", "HEAD", "POST"]
         elif parts == ["channels"]:
             methods = ["POST"]
         return ", ".join(methods + ["OPTIONS"])
@@ -1519,6 +2034,79 @@ class RelayHandler(BaseHTTPRequestHandler):
             raise ApiError(400, "%s must be 1-%d printable characters" % (name, MAX_SENDER_LEN))
         return raw
 
+    # -- monitor ------------------------------------------------------------
+
+    def _monitor_token(self) -> str | None:
+        header = self.headers.get("Authorization") or ""
+        if header.lower().startswith("bearer "):
+            return header[7:].strip()
+        return self.headers.get("X-Monitor-Token")
+
+    def _check_monitor(self) -> None:
+        self.relay.check_monitor(self._monitor_token())
+
+    def _monitor_page(self) -> None:
+        self._send(
+            200,
+            MONITOR_HTML.encode("utf-8"),
+            "text/html; charset=utf-8",
+            extra={
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "Referrer-Policy": "no-referrer",
+                "X-Robots-Tag": "noindex, nofollow",
+                "Content-Security-Policy": (
+                    "default-src 'self'; style-src 'unsafe-inline'; "
+                    "script-src 'unsafe-inline'; connect-src 'self'; "
+                    "img-src 'self' data:; base-uri 'none'; form-action 'self'"
+                ),
+            },
+        )
+
+    def _monitor_get(self, parts: list[str], query: dict[str, list[str]]) -> None:
+        self._check_monitor()
+        if parts == ["monitor", "api", "state"]:
+            limit = min(
+                self._int_query(query, "limit", DEFAULT_MONITOR_MESSAGES, 1),
+                MAX_MONITOR_MESSAGES,
+            )
+            self._send_json(200, self.relay.monitor_snapshot(limit))
+            return
+        if (
+            len(parts) == 5
+            and parts[2] == "channels"
+            and parts[4] == "messages"
+        ):
+            limit = min(
+                self._int_query(query, "limit", DEFAULT_MONITOR_MESSAGES, 1),
+                MAX_MONITOR_MESSAGES,
+            )
+            self._send_json(200, self.relay.monitor_messages(parts[3], limit))
+            return
+        raise ApiError(404, "unknown endpoint")
+
+    def _monitor_post(self, parts: list[str]) -> None:
+        self._check_monitor()
+        if not (
+            len(parts) == 5
+            and parts[2] == "channels"
+            and parts[4] == "messages"
+        ):
+            raise ApiError(404, "unknown endpoint")
+        channel = self.relay.get_channel(parts[3])
+        payload = self._json_body()
+        fields = self._message_fields(payload, {})
+        message, waiters = self.relay.post(channel, **fields)
+        with self.relay.lock:
+            latest_seq = channel.latest_seq()
+        self._send_json(201, {
+            "ok": True,
+            "message": message,
+            "cursor": message["seq"],
+            "latest_seq": latest_seq,
+            "waiters": waiters,
+        })
+
     # -- GET ----------------------------------------------------------------
 
     def _handle_get(self) -> None:
@@ -1538,6 +2126,12 @@ class RelayHandler(BaseHTTPRequestHandler):
             return
         if parts == ["healthz"]:
             self._send_json(200, self.relay.health())
+            return
+        if parts == ["monitor"]:
+            self._monitor_page()
+            return
+        if parts[:2] == ["monitor", "api"]:
+            self._monitor_get(parts, query)
             return
         if parts == ["channels"]:
             raise ApiError(405, "use POST /channels to create a channel", headers={"Allow": self._allow_for(parts)})
@@ -1741,6 +2335,9 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def _handle_post(self) -> None:
         parts, query = self._route()
+        if parts[:2] == ["monitor", "api"]:
+            self._monitor_post(parts)
+            return
         if parts == ["channels"]:
             self._create_channel()
             return
@@ -1838,34 +2435,12 @@ class RelayHandler(BaseHTTPRequestHandler):
         )
         self._send_json(200, {"ok": True, "participant": participant, "server_time": now_iso()})
 
-    def _post_message(self, channel: Channel, query: dict[str, list[str]]) -> None:
-        raw = self._read_body()
-        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        payload: dict[str, Any] = {}
-        if content_type == "application/json":
-            try:
-                parsed = json.loads(raw or b"{}")
-            except json.JSONDecodeError as exc:
-                raise ApiError(400, "invalid JSON: %s" % exc)
-            if not isinstance(parsed, dict):
-                raise ApiError(400, "JSON body must be an object")
-            payload = parsed
-        elif raw.lstrip().startswith(b"{"):
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError:
-                raise ApiError(
-                    400,
-                    "body starts with '{' but is not valid JSON; use Content-Type: application/json "
-                    "or send text that does not start with '{'",
-                )
-            if not isinstance(parsed, dict):
-                raise ApiError(400, "JSON body must be an object")
-            payload = parsed
-        else:
-            payload = {"text": raw.decode("utf-8", "replace")}
-
-        sender = self._clean_name(payload.get("sender") or self._name_query(query, "sender"), "sender", required=True)
+    def _message_fields(self, payload: dict[str, Any], query: dict[str, list[str]]) -> dict[str, Any]:
+        sender = self._clean_name(
+            payload.get("sender") or self._name_query(query, "sender"),
+            "sender",
+            required=True,
+        )
         text = payload.get("text", "")
         if text is None:
             text = ""
@@ -1909,23 +2484,51 @@ class RelayHandler(BaseHTTPRequestHandler):
                 parse_timestamp(expires_at)
             except ValueError:
                 raise ApiError(400, "expires_at must be an ISO-8601 timestamp")
+        return {
+            "sender": sender,
+            "text": text,
+            "to": to,
+            "reply_to": reply_to,
+            "data": data,
+            "kind": kind,
+            "supersedes": supersedes,
+            "requires_ack": requires_ack,
+            "priority": priority,
+            "expires_at": expires_at,
+            "state": state_value,
+            "tags": tags,
+            "correlation_id": correlation_id,
+        }
 
-        message, waiters = self.relay.post(
-            channel,
-            sender=sender,
-            text=text,
-            to=to,
-            reply_to=reply_to,
-            data=data,
-            kind=kind,
-            supersedes=supersedes,
-            requires_ack=requires_ack,
-            priority=priority,
-            expires_at=expires_at,
-            state=state_value,
-            tags=tags,
-            correlation_id=correlation_id,
-        )
+    def _post_message(self, channel: Channel, query: dict[str, list[str]]) -> None:
+        raw = self._read_body()
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        payload: dict[str, Any] = {}
+        if content_type == "application/json":
+            try:
+                parsed = json.loads(raw or b"{}")
+            except json.JSONDecodeError as exc:
+                raise ApiError(400, "invalid JSON: %s" % exc)
+            if not isinstance(parsed, dict):
+                raise ApiError(400, "JSON body must be an object")
+            payload = parsed
+        elif raw.lstrip().startswith(b"{"):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                raise ApiError(
+                    400,
+                    "body starts with '{' but is not valid JSON; use Content-Type: application/json "
+                    "or send text that does not start with '{'",
+                )
+            if not isinstance(parsed, dict):
+                raise ApiError(400, "JSON body must be an object")
+            payload = parsed
+        else:
+            payload = {"text": raw.decode("utf-8", "replace")}
+
+        fields = self._message_fields(payload, query)
+        message, waiters = self.relay.post(channel, **fields)
         with self.relay.lock:
             latest_seq = channel.latest_seq()
         self._send_json(201, {
@@ -2134,6 +2737,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--channel-ttl-hours", type=float, default=DEFAULT_TTL_HOURS, help="idle hours before a channel is removed (0 disables)")
     parser.add_argument("--max-channels", type=int, default=DEFAULT_MAX_CHANNELS, help="maximum live channels")
     parser.add_argument("--admin-token", default=None, help="require this token on POST /channels (env: RELAY_ADMIN_TOKEN)")
+    parser.add_argument("--monitor-token", default=None, help="require this bearer token on /monitor APIs (env: RELAY_MONITOR_TOKEN)")
     parser.add_argument(
         "--restore-channel",
         action="append",
@@ -2164,7 +2768,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         max_channels=args.max_channels,
         base_url=args.public_url or os.environ.get("RELAY_PUBLIC_URL"),
         admin_token=args.admin_token or os.environ.get("RELAY_ADMIN_TOKEN"),
-        revision=os.environ.get("RELAY_REVISION"),
+        monitor_token=args.monitor_token or os.environ.get("RELAY_MONITOR_TOKEN"),
         restore=restore,
     )
     httpd = make_server(args.host, args.port, relay)
