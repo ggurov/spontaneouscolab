@@ -24,7 +24,7 @@ without humans copy/pasting chat messages.
    request's base URL, so a bare channel URL teaches the full protocol.
 3. **HTTP** (`RelayHandler`, `RelayHTTPServer`, `make_server`, `main`): a
    `ThreadingHTTPServer` with manual path/query routing, body validation, long-
-   poll, and server-sent events.
+   poll, SSE, and the authenticated `/monitor` UI/API.
 
 Request flow: route path/query → resolve read-write or read-only token under
 `relay.lock` → parse and validate body/params → mutate or snapshot `Relay` under
@@ -78,7 +78,7 @@ The repo carries a vendored `.wolf/` memory tree and `.claude/` hooks from
 
 ```bash
 make run                    # python3 relay.py --host 127.0.0.1 --port 8787
-make test                   # pytest -q (60 end-to-end tests)
+make test                   # pytest -q (63 end-to-end tests)
 make smoke                  # bash scripts/smoke.sh on SMOKE_PORT=8791
 python3 -m py_compile relay.py   # fast syntax check
 PORT=9000 make run          # alternate port
@@ -140,10 +140,13 @@ third-party packages.
   or semantic change must update `SERVICE_GUIDE`, `CHANNEL_GUIDE`, their JSON
   variants, and `README.md`. Guides use `%`-formatting with `%(key)s`
   placeholders because the templates contain literal JSON braces.
-- **Capability-URL hygiene.** Never log full tokens (`mask_tokens`), never add
-  channel listings, keep `no-store`, and require `--admin-token` for creation
-  only when the deployment is exposed beyond a trusted network. The read-write
-  URL authorizes writes and `DELETE`; the read-only URL is safe for observers.
+- **Capability-URL hygiene.** Never log full tokens (`mask_tokens`); there is no
+  unauthenticated channel listing. The only aggregate view is `/monitor`,
+  protected by `--monitor-token`/`RELAY_MONITOR_TOKEN`; treat that token as an
+  administrator credential because the monitor can read all channels and inject
+  messages. Keep `no-store`, and require `--admin-token` for creation only when
+  the deployment is exposed beyond a trusted network. The read-write URL
+  authorizes writes and `DELETE`; the read-only URL is safe for observers.
 - **License.** The repository is AGPL-3.0 (`LICENSE`); `.wolf/` and `.claude/`
   are vendored epicwolf files under the same license. Keep attribution intact.
 
@@ -152,7 +155,7 @@ third-party packages.
 | Path | What it is |
 | --- | --- |
 | `relay.py` | Entire service: state, guides, HTTP handler, SSE, CLI |
-| `tests/test_relay.py` | 60 end-to-end tests over ephemeral real servers |
+| `tests/test_relay.py` | 63 end-to-end tests over ephemeral real servers |
 | `tests/conftest.py` | Adds repo root to `sys.path` so `import relay` works |
 | `scripts/smoke.sh` | Curl+python3 smoke test; starts its own server on `PORT` (set from `SMOKE_PORT`) |
 | `Makefile` | `run`, `test`, `smoke` targets and overridable variables |
@@ -186,10 +189,12 @@ Key entry points: `main()` for the process, `make_server()` for tests/embedding,
 - **Configuration is flags plus environment.** `--host` (127.0.0.1),
   `--port` (8787), `--public-url`, `--max-messages` (2000),
   `--channel-ttl-hours` (168; 0 disables expiry), `--max-channels` (10000),
-  `--admin-token` (or `RELAY_ADMIN_TOKEN`; the flag wins), `--log-level`
+  `--admin-token` (or `RELAY_ADMIN_TOKEN`; the flag wins), `--monitor-token`
+  (or `RELAY_MONITOR_TOKEN`; monitor APIs are disabled when unset), `--log-level`
   (invalid values fall back to `info`). `RELAY_REVISION` reports the build.
   `RELAY_PUBLIC_URL` pins generated links to an origin including a path prefix;
-  otherwise `X-Forwarded-Prefix` is honored. `--restore-channel
+  when empty, `X-Forwarded-Proto`/`X-Forwarded-Host`/`Host` plus
+  `X-Forwarded-Prefix` are used. `--restore-channel
   TOKEN[:NAME[:NEXT_SEQ]]` (or comma-separated `RELAY_RESTORE_CHANNELS`)
   recreates known channel URLs at startup; messages are not persisted, so
   resumed readers see `truncated:true` until their cursor reaches the restore
@@ -201,7 +206,7 @@ Key entry points: `main()` for the process, `make_server()` for tests/embedding,
 - **Guide URLs derive from headers when `--public-url`/`RELAY_PUBLIC_URL` is
   unset** (`X-Forwarded-Proto`, `X-Forwarded-Host`, then `Host`, plus
   `X-Forwarded-Prefix`). A hostile `Host` header can poison generated links, so
-  pin the public URL behind a proxy.
+  require a trusted proxy that overwrites these headers, or pin the public URL.
 - **Docker is the deployment path** (`Dockerfile` + `compose.yaml`; port 8787).
   Node.js is needed only for the vendored epicwolf hooks, not the service.
 
@@ -224,12 +229,12 @@ Key entry points: `main()` for the process, `make_server()` for tests/embedding,
   reads (`last=N`), thread and single-message reads, `to` addressing and sender
   visibility, join/presence and capability metadata, read cursors,
   acknowledgements and unacked state, supersession, derived state, artifact
-  upload/download/hash/delete, read-only URL enforcement, reply/data round-trip,
-  TTL expiry, capacity limits, forwarded-header link generation, plain-text and
-  JSON-sniffed posts, JSON error positions, clean oversized-body 413s,
-  auto-named channels, per-path `Allow`, build revision reporting, admin-token
-  gating, delete, HEAD/OPTIONS/health, and that the guides reflect effective
-  limits.
+  upload/download/hash/delete, read-only URL enforcement, monitor auth,
+  snapshot, and injection, reply/data round-trip, TTL expiry, capacity limits,
+  forwarded-header link generation, plain-text and JSON-sniffed posts, JSON
+  error positions, clean oversized-body 413s, auto-named channels, per-path
+  `Allow`, build revision reporting, admin-token gating, delete,
+  HEAD/OPTIONS/health, and that the guides reflect effective limits.
 - Add tests at the HTTP boundary with the existing helpers (`start_server`,
   `api`, `post`, `read`, `join`, `sse`, `read_sse_event`, `wait_for_waiters`);
   assert both status code and payload. For timing-sensitive cases follow the

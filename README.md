@@ -103,6 +103,10 @@ startup (messages are not preserved).
 | `GET` | `/c/<token>/status` | Participants, counters, and read cursors as JSON |
 | `DELETE` | `/c/<token>` | Close the channel (204; read-write URL only) |
 | `GET` | `/healthz` | Liveness, `revision`, protocol version, channel count, configured limits |
+| `GET` | `/monitor` | Human monitor UI: all channels, participants, messages, timing, inject form |
+| `GET` | `/monitor/api/state` | Authenticated monitor snapshot (`Authorization: Bearer <monitor token>`) |
+| `GET` | `/monitor/api/channels/<token>/messages` | Authenticated channel message tail |
+| `POST` | `/monitor/api/channels/<token>/messages` | Authenticated message injection into one channel |
 
 Messages are JSON and per-channel ordered:
 
@@ -170,7 +174,12 @@ Messages are JSON and per-channel ordered:
   Creation returns a read-write URL and a separate read-only URL; the
   read-only URL is suitable for observers and cannot mutate the channel.
 - Channel URLs are secrets: the service never logs full tokens, responses are
-  `Cache-Control: no-store`, and there are no listings of channels.
+  `Cache-Control: no-store`, and there is no unauthenticated channel listing;
+  the authenticated monitor is the only aggregate view.
+- The monitor UI is protected by a separate bearer token (`--monitor-token` /
+  `RELAY_MONITOR_TOKEN`). `/monitor` itself contains no data; its APIs list every
+  channel and can inject messages, so treat the token as an administrator
+  credential. If the token is unset, the monitor APIs return 403.
 - Reverse proxies and browsers retain URLs in logs and history: redact
   `/c/<token>` in proxy access logs. The read-write URL also authorizes
   `DELETE`, which is the only way to revoke a channel.
@@ -227,6 +236,8 @@ Everything is in memory, on purpose: it is a conversation relay, not an archive.
 | Long-poll wait | 60 s max | request parameter `wait` |
 | Request body | 1 MiB | constant in `relay.py` |
 | Log level | `info` | `--log-level` |
+| Monitor messages returned per channel | 50 default, 200 max | `limit` on `/monitor/api/state` |
+| Monitor token | empty (monitor APIs disabled) | `--monitor-token` / `RELAY_MONITOR_TOKEN` |
 
 A restart forgets all channels, messages, and artifacts. Expired channels are
 removed by a background sweep; new requests to a dead URL get `404`, an
@@ -236,7 +247,7 @@ bodies are drained up to 8 MiB where possible and rejected with JSON `413`.
 ## Tests
 
 ```bash
-make test     # pytest: 60 end-to-end tests over the real HTTP surface
+make test     # pytest: 63 end-to-end tests over the real HTTP surface
 make smoke    # curl + python3 against a live process (channel, long-poll, SSE)
 ```
 
@@ -245,9 +256,9 @@ wakeup/timeout/disconnect, graceful restart 503s and SSE drain events, SSE
 history/live delivery, `Last-Event-ID` resume and `as` filtering, tail reads,
 restore gaps, `to` addressing and sender visibility, join/presence, read
 cursors, acknowledgements, supersession, thread reads, derived state,
-artifacts, read-only URLs, idle-channel expiry, capacity limits, proxy-derived
-guide links, per-path `Allow`, build revision reporting, validation,
-admin-token gating, and channel deletion.
+artifacts, read-only URLs, monitor auth/snapshot/injection, idle-channel expiry,
+capacity limits, proxy-derived guide links, per-path `Allow`, build revision
+reporting, validation, admin-token gating, and channel deletion.
 
 ## Layout
 

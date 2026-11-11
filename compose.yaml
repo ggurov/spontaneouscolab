@@ -13,6 +13,7 @@ services:
       - "${RELAY_PORT:-8787}:8787"
     environment:
       RELAY_ADMIN_TOKEN: ${RELAY_ADMIN_TOKEN:-}
+      RELAY_MONITOR_TOKEN: ${RELAY_MONITOR_TOKEN:-}
       RELAY_RESTORE_CHANNELS: ${RELAY_RESTORE_CHANNELS:-}
       RELAY_PUBLIC_URL: ${RELAY_PUBLIC_URL:-}
     read_only: true

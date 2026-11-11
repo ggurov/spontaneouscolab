@@ -1287,3 +1287,95 @@ def test_read_only_url_is_stable_across_restore(start_server):
     status, second_guide, _ = api(second.base, "GET", "/c/" + token)
     assert status == 200
     assert first_guide["read_url"].rsplit("/", 1)[-1] == second_guide["read_url"].rsplit("/", 1)[-1]
+
+
+def test_monitor_disabled_without_token(start_server):
+    server = start_server()
+    status, raw, headers = request(
+        server.base, "GET", "/monitor", headers={"Accept": "text/html"}
+    )
+    assert status == 200
+    assert "Agent Relay monitor" in raw.decode("utf-8")
+    assert headers["Content-Type"].startswith("text/html")
+    assert headers["X-Frame-Options"] == "DENY"
+    assert "default-src" in headers.get("Content-Security-Policy", "")
+
+    status, payload, _ = api(server.base, "GET", "/monitor/api/state")
+    assert status == 403
+    assert "disabled" in payload["error"]
+
+
+def test_monitor_auth_and_snapshot(start_server):
+    server = start_server(monitor_token="monitor-secret")
+    token, url, _ = create_channel(server, "monitored")
+    join(server, url, "alice", "operator")
+    post(server, url, sender="alice", text="hello", kind="status")
+
+    status, payload, _ = api(server.base, "GET", "/monitor/api/state")
+    assert status == 401
+    status, payload, _ = api(
+        server.base,
+        "GET",
+        "/monitor/api/state",
+        headers={"Authorization": "Bearer wrong"},
+    )
+    assert status == 401
+
+    auth = {"Authorization": "Bearer monitor-secret"}
+    status, payload, _ = api(server.base, "GET", "/monitor/api/state", headers=auth)
+    assert status == 200
+    assert payload["totals"]["channels"] == 1
+    channel = payload["channels"][0]
+    assert channel["token"] == token
+    assert channel["participants"][0]["name"] == "alice"
+    assert channel["messages"][-1]["text"] == "hello"
+    assert "age_s" in channel and "idle_s" in channel and "expires_in_s" in channel
+
+    status, payload, _ = api(
+        server.base,
+        "GET",
+        "/monitor/api/channels/%s/messages" % token,
+        headers=auth,
+    )
+    assert status == 200
+    assert payload["messages"][-1]["text"] == "hello"
+
+
+def test_monitor_injects_messages(start_server):
+    server = start_server(monitor_token="monitor-secret")
+    token, url, _ = create_channel(server, "inject")
+    auth = {"Authorization": "Bearer monitor-secret"}
+    status, payload, _ = api(
+        server.base,
+        "POST",
+        "/monitor/api/channels/%s/messages" % token,
+        json_body={
+            "sender": "operator",
+            "text": "steer the bus",
+            "kind": "task",
+            "state": "open",
+            "requires_ack": True,
+        },
+        headers=auth,
+    )
+    assert status == 201, payload
+    assert payload["message"]["sender"] == "operator"
+    page = read(server, url)
+    assert page["messages"][-1]["text"] == "steer the bus"
+
+    status, payload, _ = api(
+        server.base,
+        "POST",
+        "/monitor/api/channels/%s/messages" % token,
+        json_body={"sender": "operator", "text": "unauthorized"},
+    )
+    assert status == 401
+
+    status, payload, _ = api(
+        server.base,
+        "POST",
+        "/monitor/api/channels/%s/messages" % ("0" * 32),
+        json_body={"sender": "operator", "text": "missing"},
+        headers=auth,
+    )
+    assert status == 404
